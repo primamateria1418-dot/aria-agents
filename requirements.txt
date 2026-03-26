@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+supabase
+groq
+telethon
+python-dotenv
+httpx
+apscheduler
+pydantic
