@@ -20,7 +20,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
 
-from agents.jamie import JAMIEAgent
+from agents.jamie import JAMIEHunter
 from agents.research import ResearchAgent
 from agents.writer import WriterAgent
 from agents.reporting import ReportingAgent
@@ -32,7 +32,7 @@ logger = logging.getLogger("aria.main")
 # ── Agent instances ───────────────────────────────────────────────────
 CLIENT_ID = os.environ.get("CLIENT_ID", "aria_internal")
 
-jamie    = JAMIEAgent(client_id=CLIENT_ID)
+jamie    = JAMIEHunter(client_id=CLIENT_ID)
 research = ResearchAgent(client_id=CLIENT_ID)
 writer   = WriterAgent(client_id=CLIENT_ID)
 reporting = ReportingAgent(client_id=CLIENT_ID)
