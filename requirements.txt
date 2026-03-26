@@ -7,5 +7,6 @@ python-dotenv
 httpx
 apscheduler
 pydantic
-beautifulsoup4openai
+beautifulsoup4
+openai
 requests
