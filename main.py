@@ -32,7 +32,7 @@ logger = logging.getLogger("aria.main")
 # ── Agent instances ───────────────────────────────────────────────────
 CLIENT_ID = os.environ.get("CLIENT_ID", "aria_internal")
 
-jamie    = JAMIEHunter(client_id=CLIENT_ID)
+jamie    = JAMIEHunter()
 research = ResearchAgent(client_id=CLIENT_ID)
 writer   = WriterAgent(client_id=CLIENT_ID)
 reporting = ReportingAgent(client_id=CLIENT_ID)
