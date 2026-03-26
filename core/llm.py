@@ -42,7 +42,7 @@ def call_llm(
 
 
 def _call_groq(prompt, system, max_tokens, temperature, json_mode) -> str:
-    model = os.environ.get("GROQ_MODEL", "llama3-70b-8192")
+    model = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
     kwargs = {
         "model": model,
         "messages": [
