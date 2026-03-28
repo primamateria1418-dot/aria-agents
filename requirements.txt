@@ -12,3 +12,6 @@ openai
 requests
 PyJWT
 python-multipart
+python-multipart
+PyJWT
+python-jose
