@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: aria-agents
+    runtime: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_KEY
+        sync: false
+      - key: ARIA_API_KEY
+        sync: false
+      - key: CLIENT_ID
+        value: aria_internal
+      - key: TAVILY_API_KEY
+        sync: false
+      - key: ZAPIER_LINKEDIN_WEBHOOK
+        sync: false
+      - key: PYTHONUNBUFFERED
+        value: "1"

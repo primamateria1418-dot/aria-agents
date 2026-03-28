@@ -3,21 +3,22 @@ agents/writer.py
 ARIA™ — Writer Agent (Agent 03)
 Runs at 07:00 daily. Reads Research angles from content_queue.
 Writes full drafts in client brand voice. Stores back to content_queue.
+Also handles on-demand writes from LinkedIn agent and CEO/client requests.
 OUP International Ltd, 2026
 """
 
 import os
 import json
 import logging
-from datetime import date
+from datetime import date, datetime
 from core.base_agent import BaseAgent
 from core.llm import call_llm
-from core.memory import supabase_select, supabase_update
+from core.memory import supabase_select, supabase_update, supabase_insert
 
 logger = logging.getLogger("aria.writer")
 
 
-# ── Brand voice profiles — loaded per client ─────────────────────────
+# ── Brand voice profiles ──────────────────────────────────────────────
 BRAND_VOICES = {
     "aria_internal": {
         "name": "ARIA",
@@ -48,6 +49,16 @@ BRAND_VOICES = {
     }
 }
 
+# ── Vibe writing guides for LinkedIn agent requests ───────────────────
+VIBE_GUIDES = {
+    "authority":    "Market insight or bold data-led take. Open with a surprising stat or claim. Build the case. End with a forward-looking question.",
+    "education":    "Practical how-to or framework. Numbered steps or a clear before/after. Audience leaves knowing how to do something specific.",
+    "social_proof": "Anonymised client result or case study. Lead with the outcome ('One of our clients grew qualified leads by 40% in 6 weeks.'). Story > statistics.",
+    "behind_scenes":"Pull back the curtain on how ARIA's agents work. Make AI feel human and fascinating, not threatening.",
+    "provocative":  "Take a position that challenges conventional marketing wisdom. Be specific. Expect disagreement — that's the point.",
+    "human":        "Founder story, genuine observation, something relatable. The person behind the brand. Vulnerability is a superpower here.",
+}
+
 
 class WriterAgent(BaseAgent):
     def __init__(self, client_id: str = "aria_internal"):
@@ -55,36 +66,54 @@ class WriterAgent(BaseAgent):
         self.brand_voice = BRAND_VOICES.get(client_id, BRAND_VOICES["aria_internal"])
 
     # ═══════════════════════════════════════════════════════
-    #  MAIN CYCLE
+    #  MAIN DAILY CYCLE
     # ═══════════════════════════════════════════════════════
 
     def run(self):
-        # 1. Check flags (urgent angles from Research, hot leads from JAMIE)
+        # 1. Check flags — LinkedIn urgent requests take priority
         flags = self.check_flags(resolved=False)
-        urgent_flags = [f for f in flags if f.get("priority") == "urgent"]
-        if urgent_flags:
-            self._log_action(f"Processing {len(urgent_flags)} urgent flags from peers")
+        linkedin_flags = [
+            f for f in flags
+            if f.get("from_agent") == "linkedin" and f.get("priority") == "urgent"
+        ]
+        other_urgent = [
+            f for f in flags
+            if f.get("priority") == "urgent" and f.get("from_agent") != "linkedin"
+        ]
 
-        # 2. Read CEO instructions
+        # 2. Handle LinkedIn on-demand requests first
+        for flag in linkedin_flags:
+            ctx = flag.get("context", {})
+            vibe = ctx.get("vibe")
+            day  = ctx.get("day", date.today().strftime("%A"))
+            if vibe:
+                self._log_action(f"LinkedIn urgent request — writing {vibe} post for {day}")
+                self._write_for_day(day, vibe, auto_approve=True)
+                self.resolve_flag(flag["id"])
+
+        # 3. Handle CEO/client on-demand requests
+        on_demand = self._get_pending_on_demand_requests()
+        for req in on_demand:
+            self._log_action(f"On-demand request: {req.get('topic', '?')[:60]}")
+            self._write_on_demand(req)
+
+        # 4. CEO instructions
         instructions = self.read_instructions()
         style_overrides = self._parse_style_instructions(instructions)
 
-        # 3. Get content angles from Research (today's queue, not yet drafted)
+        # 5. Standard Research angles
         angles = self._get_pending_angles()
         self._log_action(f"Found {len(angles)} pending angles from Research")
 
-        # 4. Get hot leads flagged by JAMIE for personalised outreach
-        hot_leads = self._get_hot_leads(urgent_flags)
+        hot_leads = self._get_hot_leads(other_urgent)
 
-        # 5. Write drafts for angles
         drafted = 0
-        for angle in angles[:4]:  # Cap at 4 per cycle — quality over quantity
+        for angle in angles[:4]:
             draft = self._write_content(angle, style_overrides)
             if draft:
                 self._save_draft(angle["id"], draft, angle.get("content_type", "linkedin_post"))
                 drafted += 1
 
-        # 6. Write personalised outreach for hot leads
         outreach_drafted = 0
         for lead in hot_leads[:2]:
             outreach = self._write_outreach(lead, style_overrides)
@@ -93,43 +122,185 @@ class WriterAgent(BaseAgent):
                 outreach_drafted += 1
 
         self._log_action(f"Drafted {drafted} content pieces + {outreach_drafted} outreach")
-        self._log_outcome(f"{drafted} drafts in approval queue · {outreach_drafted} personalised outreach")
+        self._log_outcome(f"{drafted} drafts in review queue · {outreach_drafted} personalised outreach")
         self._set_metric("drafts_written", drafted)
         self._set_metric("outreach_drafted", outreach_drafted)
-        self._set_metric("angles_available", len(angles))
+        self._set_metric("on_demand_written", len(on_demand))
 
-        # 7. Flag Research if we need more angles
         if len(angles) < 2:
             self.raise_flag(
                 "research",
-                f"Need more angles — only {len(angles)} available today. More B2B SaaS and AI content needed.",
+                f"Need more angles — only {len(angles)} available today.",
                 priority="normal"
             )
 
     # ═══════════════════════════════════════════════════════
-    #  CONTENT RETRIEVAL
+    #  ON-DEMAND: LINKEDIN DAY/VIBE
+    # ═══════════════════════════════════════════════════════
+
+    def _write_for_day(self, day: str, vibe: str, auto_approve: bool = False) -> dict | None:
+        """
+        Write a LinkedIn post for a specific day vibe.
+        Called directly by LinkedIn agent via flag.
+        auto_approve=True so LinkedIn agent can post without CEO bottleneck.
+        """
+        voice     = self.brand_voice
+        vibe_desc = VIBE_GUIDES.get(vibe, f"LinkedIn post with a {vibe} angle.")
+
+        prompt = f"""You are the Writer agent for {voice['name']}.
+
+Brand voice: {voice['tone']}
+Target audience: {voice['audience']}
+Avoid: {voice['avoid']}
+LinkedIn style: {voice['linkedin_style']}
+
+Today is {day}. Write a LinkedIn post with this vibe:
+Vibe: {vibe}
+Direction: {vibe_desc}
+
+Length: 150-280 words.
+No hashtag spam — 2 maximum, only if genuinely relevant.
+No emojis unless they serve the post.
+Write ONLY the post. No preamble, no explanation."""
+
+        try:
+            content = call_llm(prompt, max_tokens=400, temperature=0.8)
+            content = content.strip()
+        except Exception as e:
+            logger.error(f"_write_for_day failed [{vibe}]: {e}")
+            return None
+
+        row = supabase_insert("content_queue", {
+            "client_id":    self.client_id,
+            "content_type": "linkedin_post",
+            "platform":     "linkedin",
+            "draft":        content,
+            "vibe":         vibe,
+            "scheduled_for":date.today().isoformat(),
+            "approved":     auto_approve,
+            "published":    False,
+            "status":       "approved" if auto_approve else "pending_review",
+            "created_by":   "writer",
+            "requested_by": "linkedin",
+        })
+
+        self._log_outcome(f"Wrote {vibe} post for {day} — {len(content)} chars — auto_approve={auto_approve}")
+        return row
+
+    # ═══════════════════════════════════════════════════════
+    #  ON-DEMAND: CEO / CLIENT REQUEST
+    # ═══════════════════════════════════════════════════════
+
+    def _write_on_demand(self, request: dict) -> dict | None:
+        """
+        Write content from a CEO or client request submitted via dashboard.
+        Saves to content_queue with status='pending_review' for CEO approval.
+        """
+        topic       = request.get("topic", "")
+        format_type = request.get("format", "linkedin_post")
+        platform    = request.get("platform", "linkedin")
+        requested_by= request.get("requested_by", "client")
+        request_id  = request.get("id")
+        vibe        = request.get("vibe", "")
+
+        voice = self.brand_voice
+
+        format_instructions = {
+            "linkedin_post": f"LinkedIn post. Style: {voice['linkedin_style']}. 150-300 words.",
+            "email":         f"Marketing email with subject line. Style: {voice['email_style']}.",
+            "blog":          f"Blog article. Style: {voice['blog_style']}.",
+            "thread":        "Twitter/X thread. 5-8 tweets, numbered. Each under 280 chars.",
+        }.get(format_type, "LinkedIn post. 150-300 words.")
+
+        vibe_note = f"\nVibe/angle: {VIBE_GUIDES.get(vibe, vibe)}" if vibe else ""
+
+        prompt = f"""You are the Writer agent for {voice['name']}.
+
+Brand voice: {voice['tone']}
+Target audience: {voice['audience']}
+Avoid: {voice['avoid']}
+Format: {format_instructions}{vibe_note}
+
+Content request: {topic}
+
+Today's date: {date.today().strftime('%d %B %Y')}
+
+Write the full content piece now. No preamble — just the content."""
+
+        try:
+            content = call_llm(prompt, max_tokens=900, temperature=0.75)
+            content = content.strip()
+        except Exception as e:
+            logger.error(f"_write_on_demand failed: {e}")
+            # Mark request as failed
+            if request_id:
+                supabase_update(
+                    "content_requests",
+                    row_id=request_id,
+                    data={"status": "failed", "error": str(e)}
+                )
+            return None
+
+        # Save draft to content_queue
+        row = supabase_insert("content_queue", {
+            "client_id":    self.client_id,
+            "content_type": format_type,
+            "platform":     platform,
+            "draft":        content,
+            "vibe":         vibe or None,
+            "approved":     False,
+            "published":    False,
+            "status":       "pending_review",
+            "created_by":   "writer",
+            "requested_by": requested_by,
+            "request_id":   request_id,
+        })
+
+        # Mark original request as fulfilled
+        if request_id:
+            supabase_update(
+                "content_requests",
+                row_id=request_id,
+                data={
+                    "status":       "fulfilled",
+                    "fulfilled_at": datetime.utcnow().isoformat(),
+                    "content_id":   row.get("id") if row else None,
+                }
+            )
+
+        self._log_outcome(f"On-demand draft written [{format_type}] — {len(content)} chars — requested by: {requested_by}")
+        return row
+
+    def _get_pending_on_demand_requests(self) -> list:
+        """Get unfulfilled content requests from CEO or clients."""
+        return supabase_select(
+            "content_requests",
+            filters={
+                "client_id": self.client_id,
+                "status":    "pending",
+            },
+            limit=5
+        )
+
+    # ═══════════════════════════════════════════════════════
+    #  STANDARD PIPELINE (unchanged from original)
     # ═══════════════════════════════════════════════════════
 
     def _get_pending_angles(self) -> list:
-        """Get Research angles not yet drafted (draft still starts with 'ANGLE:')."""
         rows = supabase_select(
             "content_queue",
             filters={
-                "client_id": self.client_id,
+                "client_id":  self.client_id,
                 "created_by": "research",
-                "approved": False,
-                "published": False,
+                "approved":   False,
+                "published":  False,
             },
             limit=10
         )
-        # Only angles not yet written (still contain the raw angle marker)
         return [r for r in rows if r.get("draft", "").startswith("ANGLE:")]
 
     def _get_hot_leads(self, urgent_flags: list) -> list:
-        """Get hot leads from JAMIE flags and leads table."""
         hot_leads = []
-
-        # From urgent flags with lead context
         for flag in urgent_flags:
             if flag.get("from_agent") == "jamie":
                 ctx = flag.get("context", {})
@@ -139,24 +310,20 @@ class WriterAgent(BaseAgent):
                         filters={"id": ctx["lead_id"], "client_id": self.client_id}
                     )
                     hot_leads.extend(leads)
-
-        # Also check leads table directly for unflagged hot leads
         if not hot_leads:
             all_hot = supabase_select(
                 "leads",
                 filters={
-                    "client_id": self.client_id,
+                    "client_id":  self.client_id,
                     "flagged_to": "writer",
-                    "status": "new"
+                    "status":     "new"
                 },
                 limit=3
             )
             hot_leads.extend(all_hot)
-
         return hot_leads
 
     def _parse_style_instructions(self, instructions: list) -> dict:
-        """Extract style/tone overrides from CEO instructions."""
         overrides = {}
         for inst in instructions:
             text = inst.get("instruction", "").lower()
@@ -168,21 +335,14 @@ class WriterAgent(BaseAgent):
                 overrides["length_override"] = inst["instruction"]
         return overrides
 
-    # ═══════════════════════════════════════════════════════
-    #  CONTENT WRITING
-    # ═══════════════════════════════════════════════════════
-
     def _write_content(self, angle: dict, style_overrides: dict) -> str | None:
-        """Write a full content draft from a Research angle."""
-        raw_draft = angle.get("draft", "")
+        raw_draft    = angle.get("draft", "")
         content_type = angle.get("content_type", "linkedin_post")
-        platform = angle.get("platform", "linkedin")
+        voice        = self.brand_voice
 
-        # Parse the angle from the Research draft
-        angle_text = raw_draft.replace("ANGLE:", "").split("\n\n")[0].strip()
+        angle_text   = raw_draft.replace("ANGLE:", "").split("\n\n")[0].strip()
         angle_detail = "\n\n".join(raw_draft.split("\n\n")[1:])
 
-        voice = self.brand_voice
         style_note = ""
         if style_overrides.get("tone_override"):
             style_note = f"\nCEO override: {style_overrides['tone_override']}"
@@ -191,10 +351,10 @@ class WriterAgent(BaseAgent):
 
         format_instructions = {
             "linkedin_post": f"LinkedIn post. Style: {voice['linkedin_style']}. 150-300 words.",
-            "email": f"Marketing email. Style: {voice['email_style']}. Include subject line.",
-            "blog": f"Blog article. Style: {voice['blog_style']}.",
-            "thread": "Twitter/X thread. 5-8 tweets, numbered. Each tweet under 280 chars.",
-        }.get(content_type, f"LinkedIn post. 150-300 words.")
+            "email":         f"Marketing email. Style: {voice['email_style']}. Include subject line.",
+            "blog":          f"Blog article. Style: {voice['blog_style']}.",
+            "thread":        "Twitter/X thread. 5-8 tweets, numbered. Each tweet under 280 chars.",
+        }.get(content_type, "LinkedIn post. 150-300 words.")
 
         prompt = f"""You are the Writer agent for {voice['name']}.
 
@@ -212,28 +372,21 @@ Additional context:
 
 Today's date: {date.today().strftime('%d %B %Y')}
 
-Write the full content piece now. No preamble, no explanation — just the content itself."""
+Write the full content piece now. No preamble — just the content."""
 
         try:
-            draft = call_llm(
-                prompt,
-                system=f"You are a world-class copywriter for {voice['name']}. Write only the requested content.",
-                max_tokens=800,
-                temperature=0.75
-            )
-            return draft.strip()
+            return call_llm(prompt, max_tokens=800, temperature=0.75).strip()
         except Exception as e:
             logger.error(f"Writing failed for angle: {e}")
             return None
 
     def _write_outreach(self, lead: dict, style_overrides: dict) -> str | None:
-        """Write personalised outreach for a hot lead."""
-        voice = self.brand_voice
+        voice     = self.brand_voice
         lead_name = lead.get("display_name") or lead.get("username") or "there"
-        message = lead.get("message_text", "")
-        group = lead.get("group_name", "")
-        score = lead.get("score", 7)
-        reason = lead.get("score_reason", "")
+        message   = lead.get("message_text", "")
+        group     = lead.get("group_name", "")
+        score     = lead.get("score", 7)
+        reason    = lead.get("score_reason", "")
 
         prompt = f"""You are the Writer agent for {voice['name']}, writing personalised outreach.
 
@@ -247,70 +400,53 @@ Lead details:
 - Why they're a hot lead: {reason}
 - Their message/activity: {message[:300]}
 
-Write a short, personalised LinkedIn DM or Telegram message (100-150 words max).
-- Reference something specific from their message/context
-- Lead with value, not a pitch
-- End with a soft question or CTA
-- Sound human, not automated
-- Match our brand voice
-
-Write ONLY the message — no subject line, no explanation."""
+Write a short, personalised LinkedIn DM (100-150 words max).
+Reference something specific from their context. Lead with value. End with a soft CTA.
+Sound human, not automated. Write ONLY the message."""
 
         try:
-            outreach = call_llm(
-                prompt,
-                system=f"You are a senior BD writer for {voice['name']}. Write human, personalised outreach.",
-                max_tokens=300,
-                temperature=0.8
-            )
-            return outreach.strip()
+            return call_llm(prompt, max_tokens=300, temperature=0.8).strip()
         except Exception as e:
             logger.error(f"Outreach writing failed: {e}")
             return None
 
-    # ═══════════════════════════════════════════════════════
-    #  STORAGE
-    # ═══════════════════════════════════════════════════════
-
     def _save_draft(self, angle_id: str, draft: str, content_type: str):
-        """Update the content_queue row with the full draft."""
         supabase_update(
             "content_queue",
             row_id=angle_id,
             data={
-                "draft": draft,
+                "draft":      draft,
                 "created_by": "writer",
-                "approved": False,
-                "published": False,
+                "approved":   False,
+                "published":  False,
+                "status":     "pending_review",
             }
         )
         self._log_outcome(f"Draft saved [{content_type}] — {len(draft)} chars")
 
     def _save_outreach_draft(self, lead: dict, outreach: str):
-        """Store personalised outreach as a new content_queue row."""
-        from core.memory import supabase_insert
         supabase_insert("content_queue", {
-            "client_id": self.client_id,
+            "client_id":    self.client_id,
             "content_type": "linkedin_post",
-            "platform": "linkedin",
-            "draft": f"[PERSONALISED OUTREACH — {lead.get('display_name', 'Lead')}]\n\n{outreach}",
-            "approved": False,
-            "published": False,
-            "lead_id": lead.get("id"),
-            "created_by": "writer"
+            "platform":     "linkedin",
+            "draft":        f"[PERSONALISED OUTREACH — {lead.get('display_name', 'Lead')}]\n\n{outreach}",
+            "approved":     False,
+            "published":    False,
+            "status":       "pending_review",
+            "lead_id":      lead.get("id"),
+            "created_by":   "writer",
+            "requested_by": "writer",
         })
-        self._log_outcome(f"Outreach draft saved for lead: {lead.get('display_name', '?')}")
-
-        # Update lead status
         supabase_update(
             "leads",
             row_id=lead["id"],
             data={"status": "contacted", "flagged_to": None}
         )
+        self._log_outcome(f"Outreach draft saved for lead: {lead.get('display_name', '?')}")
 
 
 # ═══════════════════════════════════════════════════════════
-#  CLI TEST MODE
+#  CLI
 # ═══════════════════════════════════════════════════════════
 
 if __name__ == "__main__":
@@ -328,25 +464,29 @@ if __name__ == "__main__":
     if "--test" in sys.argv:
         print(f"=== WRITER AGENT — TEST MODE (client: {client_id}) ===")
         agent._log_action("TEST: Wrote 2 dummy drafts")
-        agent._log_outcome("TEST: 2 drafts in approval queue")
         agent._set_metric("drafts_written", 2)
-        reflection = agent.self_review()
-        print(json.dumps(reflection, indent=2))
-        print("✓ Test complete")
+        print(json.dumps(agent.self_review(), indent=2))
+
     elif "--demo" in sys.argv:
-        print(f"=== WRITER AGENT — DEMO WRITE ===")
-        voice = agent.brand_voice
-        print(f"Brand: {voice['name']} · Tone: {voice['tone'][:60]}...")
-        # Write one sample piece
-        sample_angle = {
-            "id": "demo",
-            "draft": "ANGLE: Why AI marketing agencies outperform in-house teams at 1/5 the cost\n\nStudies show AI-powered content creation delivers 3x the output at 20% the cost of traditional agencies. Here's the breakdown.",
-            "content_type": "linkedin_post",
-            "platform": "linkedin"
+        print("=== WRITER AGENT — DEMO: on-demand vibe write ===")
+        result = agent._write_for_day("Monday", "authority", auto_approve=False)
+        print(f"Result: {result}")
+
+    elif "--on-demand" in sys.argv:
+        print("=== WRITER AGENT — DEMO: client request ===")
+        fake_request = {
+            "id":           "demo-001",
+            "client_id":    client_id,
+            "topic":        "Why most startups waste 60% of their marketing budget in year one",
+            "format":       "linkedin_post",
+            "platform":     "linkedin",
+            "vibe":         "provocative",
+            "requested_by": "client",
+            "status":       "pending",
         }
-        result = agent._write_content(sample_angle, {})
-        print("\n--- DRAFT OUTPUT ---\n")
-        print(result)
+        result = agent._write_on_demand(fake_request)
+        print(f"Result: {result}")
+
     else:
         print(f"=== WRITER AGENT — LIVE RUN (client: {client_id}) ===")
         agent.execute_cycle()
