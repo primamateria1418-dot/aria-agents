@@ -28,7 +28,6 @@ from agents.research import ResearchAgent
 from agents.writer import WriterAgent
 from agents.reporting import ReportingAgent
 from agents.linkedin import LinkedInAgent
-from agents.publisher import Publisher
 from core.memory import supabase_select, supabase_insert, supabase_update
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
@@ -505,23 +504,6 @@ async def seed_evergreen(_=Depends(verify_api_key)):
     """
     asyncio.create_task(asyncio.to_thread(linkedin.seed_evergreen_reserve))
     return {"status": "seeding", "message": "Writer is generating 10 evergreen posts — check evergreen_reserve table in ~60 seconds"}
-
-
-@app.get("/publish/profiles")
-async def get_publish_profiles(platform: str = "linkedin", _=Depends(verify_api_key)):
-    """
-    Returns available publish profiles for the current client.
-    Used by dashboard profile selector in approval panel.
-    Scaleable — add new platforms/profiles in publisher.py DEFAULT_PROFILES.
-    """
-    pub = Publisher(client_id=CLIENT_ID)
-    profiles = pub.get_profiles(platform=platform if platform != "all" else None)
-    return {
-        "client_id": CLIENT_ID,
-        "platform":  platform,
-        "profiles":  profiles,
-        "count":     len(profiles),
-    }
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
