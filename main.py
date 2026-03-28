@@ -322,7 +322,7 @@ async def morning_briefing(client_id: str = Depends(get_client_id)):
 
 @app.get("/content/queue")
 async def content_queue(approved: bool = None, client_id: str = Depends(get_client_id)):
-    filters = {"client_id": CLIENT_ID}
+    filters = {"client_id": client_id}
     if approved is not None:
         filters["approved"] = approved
     content = supabase_select("content_queue", filters=filters, limit=50)
@@ -357,10 +357,10 @@ async def review_queue(client_id: str = Depends(get_client_id)):
     Dashboard content review queue.
     Returns all content pending CEO approval, grouped by status.
     """
-    pending  = supabase_select("content_queue", filters={"client_id": CLIENT_ID, "status": "pending_review"}, limit=50)
-    approved = supabase_select("content_queue", filters={"client_id": CLIENT_ID, "status": "approved", "published": False}, limit=20)
-    scheduled= supabase_select("content_queue", filters={"client_id": CLIENT_ID, "status": "scheduled"}, limit=20)
-    requests = supabase_select("content_requests", filters={"client_id": CLIENT_ID, "status": "pending"}, limit=20)
+    pending  = supabase_select("content_queue", filters={"client_id": client_id, "status": "pending_review"}, limit=50)
+    approved = supabase_select("content_queue", filters={"client_id": client_id, "status": "approved", "published": False}, limit=20)
+    scheduled= supabase_select("content_queue", filters={"client_id": client_id, "status": "scheduled"}, limit=20)
+    requests = supabase_select("content_requests", filters={"client_id": client_id, "status": "pending"}, limit=20)
 
     return {
         "pending_review": pending,
@@ -383,7 +383,7 @@ async def submit_content_request(payload: ContentRequest, client_id: str = Depen
     Saves to content_requests table → Writer picks it up immediately (urgent) or next cycle.
     """
     row = supabase_insert("content_requests", {
-        "client_id":    CLIENT_ID,
+        "client_id":    client_id,
         "topic":        payload.topic,
         "format":       payload.format,
         "platform":     payload.platform,
@@ -429,7 +429,7 @@ async def approve_content(payload: ContentApproval, client_id: str = Depends(get
     If post_immediately=True → triggers LinkedIn agent right away.
     If schedule_for is set → marks as scheduled for that datetime.
     """
-    content = supabase_select("content_queue", filters={"id": payload.content_id}, limit=1)
+    content = supabase_select("content_queue", filters={"id": payload.content_id, "client_id": client_id}, limit=1)
     if not content:
         raise HTTPException(status_code=404, detail="Content not found")
 
@@ -556,7 +556,7 @@ async def get_schedule(client_id: str = Depends(get_client_id)):
     """
     scheduled = supabase_select(
         "content_queue",
-        filters={"client_id": CLIENT_ID, "approved": True, "published": False},
+        filters={"client_id": client_id, "approved": True, "published": False},
         order_by="scheduled_for",
         limit=30
     )
@@ -740,7 +740,7 @@ class RouteToggle(BaseModel):
 async def list_routes(client: Optional[str] = None, client_id: str = Depends(get_client_id)):
     """All Zapier routes — optionally filter by client."""
     from agents.linkedin import get_all_routes
-    cid    = client or CLIENT_ID
+    cid    = client or client_id
     routes = get_all_routes(cid)
     return {"routes": routes, "count": len(routes)}
 
