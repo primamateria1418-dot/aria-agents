@@ -11,3 +11,4 @@ beautifulsoup4
 openai
 requests
 PyJWT
+python-multipart
