@@ -15,13 +15,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 from apscheduler.triggers.interval import IntervalTrigger
+import jwt
+import hashlib
+import base64
 
 from agents.jamie import JAMIEHunter
 from agents.research import ResearchAgent
@@ -33,9 +37,32 @@ from core.memory import supabase_select, supabase_insert, supabase_update
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("aria.main")
 
-# ── Agent instances ───────────────────────────────────────────────────
-CLIENT_ID = os.environ.get("CLIENT_ID", "aria_internal")
+# ── JWT Config ────────────────────────────────────────────────────────
+JWT_SECRET  = os.environ.get("JWT_SECRET", "aria-jwt-secret-change-in-production")
+JWT_ALGO    = "HS256"
 
+def create_client_token(client_id: str) -> str:
+    return jwt.encode({"client_id": client_id, "iss": "aria"}, JWT_SECRET, algorithm=JWT_ALGO)
+
+def decode_client_token(token: str) -> str:
+    try:
+        payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGO])
+        return payload["client_id"]
+    except Exception:
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+
+# ── Agent factory — creates per-client agent instances ───────────────
+def get_agents(client_id: str):
+    return {
+        "jamie":     JAMIEHunter(),
+        "research":  ResearchAgent(client_id=client_id),
+        "writer":    WriterAgent(client_id=client_id),
+        "reporting": ReportingAgent(client_id=client_id),
+        "linkedin":  LinkedInAgent(client_id=client_id),
+    }
+
+# ── Default internal agents for scheduler ────────────────────────────
+CLIENT_ID = os.environ.get("CLIENT_ID", "aria_internal")
 jamie     = JAMIEHunter()
 research  = ResearchAgent(client_id=CLIENT_ID)
 writer    = WriterAgent(client_id=CLIENT_ID)
@@ -111,11 +138,27 @@ app.add_middleware(
 # ── Auth ──────────────────────────────────────────────────────────────
 ARIA_API_KEY = os.environ.get("ARIA_API_KEY", "")
 
-
 def verify_api_key(x_api_key: str = Header(default="")):
     if ARIA_API_KEY and x_api_key != ARIA_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
     return x_api_key
+
+def get_client_id(
+    x_client_token: str = Header(default=""),
+    x_api_key: str = Header(default="")
+) -> str:
+    """
+    Extract client_id from JWT token.
+    Falls back to env CLIENT_ID for internal/legacy calls using API key only.
+    """
+    if x_client_token:
+        return decode_client_token(x_client_token)
+    # Legacy API key auth — use default client
+    if ARIA_API_KEY and x_api_key == ARIA_API_KEY:
+        return CLIENT_ID
+    if not ARIA_API_KEY:
+        return CLIENT_ID
+    raise HTTPException(status_code=401, detail="Authentication required")
 
 
 # ── Models ────────────────────────────────────────────────────────────
@@ -154,13 +197,37 @@ class CEOOverride(BaseModel):
     instruction: str
     trigger_immediately: bool = True
 
+class ClientLogin(BaseModel):
+    access_code: str
+
+class ClientOnboard(BaseModel):
+    # Identity
+    client_id: str           # unique slug e.g. "acme_corp"
+    name: str                # display name e.g. "Acme Corp"
+    access_code: str         # login password for dashboard
+    plan: str = "growth"     # starter | growth | scale | enterprise
+    # Brand voice
+    brand_tone: str = ""
+    target_audience: str = ""
+    content_goals: str = ""  # leads | awareness | thought_leadership
+    avoid: str = ""          # words/topics to avoid
+    linkedin_style: str = ""
+    # Contact
+    contact_name: str = ""
+    contact_email: str = ""
+    # LinkedIn
+    linkedin_company_id: str = ""
+    linkedin_make_webhook: str = ""
+    # Billing
+    monthly_fee: str = ""
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  EXISTING ENDPOINTS
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.get("/status")
-async def status():
+async def status(client_id: str = Depends(get_client_id)):
     jobs = [
         {"id": j.id, "next_run": str(j.next_run_time) if j.next_run_time else "paused"}
         for j in scheduler.get_jobs()
@@ -234,12 +301,12 @@ async def get_agent_report(name: str, _=Depends(verify_api_key)):
 
 
 @app.get("/briefing")
-async def morning_briefing(_=Depends(verify_api_key)):
+async def morning_briefing(client_id: str = Depends(get_client_id)):
     today   = date.today().isoformat()
-    reports = supabase_select("reports", filters={"client_id": CLIENT_ID, "cycle_date": today}, limit=20)
-    flags   = supabase_select("agent_flags", filters={"client_id": CLIENT_ID, "resolved": False}, limit=20)
-    pending = supabase_select("content_queue", filters={"client_id": CLIENT_ID, "approved": False, "published": False}, limit=10)
-    leads   = supabase_select("leads", filters={"client_id": CLIENT_ID}, order_by="created_at", limit=5)
+    reports = supabase_select("reports", filters={"client_id": client_id, "cycle_date": today}, limit=20)
+    flags   = supabase_select("agent_flags", filters={"client_id": client_id, "resolved": False}, limit=20)
+    pending = supabase_select("content_queue", filters={"client_id": client_id, "approved": False, "published": False}, limit=10)
+    leads   = supabase_select("leads", filters={"client_id": client_id}, order_by="created_at", limit=5)
     hot_leads = [l for l in leads if l.get("score", 0) >= 8]
 
     return {
@@ -254,7 +321,7 @@ async def morning_briefing(_=Depends(verify_api_key)):
 
 
 @app.get("/content/queue")
-async def content_queue(approved: bool = None, _=Depends(verify_api_key)):
+async def content_queue(approved: bool = None, client_id: str = Depends(get_client_id)):
     filters = {"client_id": CLIENT_ID}
     if approved is not None:
         filters["approved"] = approved
@@ -285,7 +352,7 @@ async def get_flags(resolved: bool = False, _=Depends(verify_api_key)):
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.get("/content/review-queue")
-async def review_queue(_=Depends(verify_api_key)):
+async def review_queue(client_id: str = Depends(get_client_id)):
     """
     Dashboard content review queue.
     Returns all content pending CEO approval, grouped by status.
@@ -310,7 +377,7 @@ async def review_queue(_=Depends(verify_api_key)):
 
 
 @app.post("/content/request")
-async def submit_content_request(payload: ContentRequest, _=Depends(verify_api_key)):
+async def submit_content_request(payload: ContentRequest, client_id: str = Depends(get_client_id)):
     """
     Client or CEO submits a content request.
     Saves to content_requests table → Writer picks it up immediately (urgent) or next cycle.
@@ -356,7 +423,7 @@ async def submit_content_request(payload: ContentRequest, _=Depends(verify_api_k
 
 
 @app.post("/content/approve")
-async def approve_content(payload: ContentApproval, _=Depends(verify_api_key)):
+async def approve_content(payload: ContentApproval, client_id: str = Depends(get_client_id)):
     """
     CEO approves, rejects, or requests changes on a content piece.
     If post_immediately=True → triggers LinkedIn agent right away.
@@ -413,7 +480,7 @@ async def approve_content(payload: ContentApproval, _=Depends(verify_api_key)):
 
 
 @app.patch("/content/edit")
-async def edit_content(payload: ContentEdit, _=Depends(verify_api_key)):
+async def edit_content(payload: ContentEdit, client_id: str = Depends(get_client_id)):
     """
     CEO directly edits a draft before approving.
     Overwrites the draft field and marks as pending_review.
@@ -482,7 +549,7 @@ async def ceo_override(payload: CEOOverride, _=Depends(verify_api_key)):
 
 
 @app.get("/content/schedule")
-async def get_schedule(_=Depends(verify_api_key)):
+async def get_schedule(client_id: str = Depends(get_client_id)):
     """
     Returns the upcoming content schedule — all approved/scheduled pieces.
     Used by dashboard calendar view.
@@ -504,6 +571,145 @@ async def seed_evergreen(_=Depends(verify_api_key)):
     """
     asyncio.create_task(asyncio.to_thread(linkedin.seed_evergreen_reserve))
     return {"status": "seeding", "message": "Writer is generating 10 evergreen posts — check evergreen_reserve table in ~60 seconds"}
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  AUTH — login + token generation
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.post("/auth/login")
+async def login(payload: ClientLogin):
+    """
+    Dashboard login. Validates access code against clients table.
+    Returns JWT token containing client_id.
+    """
+    clients = supabase_select("clients", filters={"access_code": payload.access_code, "active": True}, limit=1)
+    if not clients:
+        raise HTTPException(status_code=401, detail="Invalid access code")
+    client = clients[0]
+    token = create_client_token(client["client_id"])
+    return {
+        "token":     token,
+        "client_id": client["client_id"],
+        "name":      client["name"],
+        "plan":      client["plan"],
+        "avatar":    client.get("avatar", client["name"][0].upper()),
+        "contact":   client.get("contact_name", ""),
+    }
+
+@app.get("/auth/me")
+async def me(client_id: str = Depends(get_client_id)):
+    """Validate token and return client profile."""
+    clients = supabase_select("clients", filters={"client_id": client_id}, limit=1)
+    if not clients:
+        raise HTTPException(status_code=404, detail="Client not found")
+    return clients[0]
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  CLIENT ONBOARDING — auto-provisions everything for a new client
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.post("/admin/onboard")
+async def onboard_client(payload: ClientOnboard, _=Depends(verify_api_key)):
+    """
+    ARIA admin only. Creates a new client and provisions everything:
+    - clients table row
+    - brand_profiles row (AI training data)
+    - zapier_routes row (if LinkedIn details provided)
+    - returns JWT token for the new client
+    """
+    # Check client_id not already taken
+    existing = supabase_select("clients", filters={"client_id": payload.client_id}, limit=1)
+    if existing:
+        raise HTTPException(status_code=409, detail=f"Client ID '{payload.client_id}' already exists")
+
+    # 1. Create client record
+    client_row = supabase_insert("clients", {
+        "client_id":    payload.client_id,
+        "name":         payload.name,
+        "access_code":  payload.access_code,
+        "plan":         payload.plan,
+        "avatar":       payload.name[0].upper(),
+        "contact_name": payload.contact_name,
+        "contact_email":payload.contact_email,
+        "monthly_fee":  payload.monthly_fee,
+        "active":       True,
+    })
+
+    # 2. Create brand profile (AI training data)
+    supabase_insert("brand_profiles", {
+        "client_id":       payload.client_id,
+        "name":            payload.name,
+        "tone":            payload.brand_tone or f"Professional and authoritative voice for {payload.name}",
+        "target_audience": payload.target_audience,
+        "content_goals":   payload.content_goals,
+        "avoid":           payload.avoid,
+        "linkedin_style":  payload.linkedin_style or "Short paragraphs, punchy opener, ends with question or CTA",
+        "email_style":     "Clear subject line, 3 paragraphs max, one CTA",
+        "blog_style":      "1,500-2,000 words, SEO-optimised, H2 subheadings, practical takeaways",
+    })
+
+    # 3. Create LinkedIn route if webhook provided
+    if payload.linkedin_make_webhook and payload.linkedin_company_id:
+        from agents.linkedin import add_route
+        add_route(
+            client_id    = payload.client_id,
+            platform     = "linkedin",
+            account_type = "company_page",
+            account_name = payload.name,
+            webhook_url  = payload.linkedin_make_webhook,
+            notes        = f"Auto-provisioned on onboarding",
+        )
+        # Store company ID
+        supabase_update("zapier_routes",
+            row_id=None,  # update by client_id instead
+            data={"account_id": payload.linkedin_company_id}
+        ) if False else None  # handled in add_route
+
+    # 4. Seed brand voice into writer BRAND_VOICES (runtime, not persistent — brand_profiles table is source of truth)
+
+    # 5. Generate JWT token for new client
+    token = create_client_token(payload.client_id)
+
+    logger.info(f"New client onboarded: {payload.client_id} ({payload.name})")
+
+    return {
+        "status":    "onboarded",
+        "client_id": payload.client_id,
+        "name":      payload.name,
+        "token":     token,
+        "message":   f"{payload.name} is ready. Share the access code with the client.",
+    }
+
+
+@app.get("/admin/clients")
+async def list_clients(_=Depends(verify_api_key)):
+    """List all clients — ARIA admin only."""
+    clients = supabase_select("clients", limit=100)
+    return {"clients": clients, "count": len(clients)}
+
+
+@app.post("/admin/upload-brand-asset/{client_id}")
+async def upload_brand_asset(
+    client_id: str,
+    asset_type: str = Form(...),  # logo | brand_guide | colours
+    file: UploadFile = File(...),
+    _=Depends(verify_api_key)
+):
+    """Upload brand assets for a client. Stores to Supabase storage."""
+    contents = await file.read()
+    b64 = base64.b64encode(contents).decode()
+
+    supabase_insert("brand_assets", {
+        "client_id":  client_id,
+        "asset_type": asset_type,
+        "filename":   file.filename,
+        "mimetype":   file.content_type,
+        "data_b64":   b64,
+    })
+
+    return {"status": "uploaded", "client_id": client_id, "asset_type": asset_type, "filename": file.filename}
 
 
 # ── Helpers ───────────────────────────────────────────────────────────
@@ -531,7 +737,7 @@ class RouteToggle(BaseModel):
 
 
 @app.get("/platforms/routes")
-async def list_routes(client: Optional[str] = None, _=Depends(verify_api_key)):
+async def list_routes(client: Optional[str] = None, client_id: str = Depends(get_client_id)):
     """All Zapier routes — optionally filter by client."""
     from agents.linkedin import get_all_routes
     cid    = client or CLIENT_ID
