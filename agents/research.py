@@ -99,9 +99,16 @@ class ResearchAgent(BaseAgent):
         return all_topics[:10]  # Cap at 10 to stay within rate limits
 
     def _get_base_topics(self) -> list:
-        """Default daily scan topics — overridable via CEO instructions."""
-        # These are the ARIA internal / growth-focused defaults
-        # OUP deployment would swap these for grant/donor topics
+        """Load research topics from brand_profiles. Falls back to ARIA defaults."""
+        try:
+            profiles = supabase_select("brand_profiles", filters={"client_id": self.client_id}, limit=1)
+            if profiles and profiles[0].get("research_topics"):
+                topics = [t.strip() for t in profiles[0]["research_topics"].split(",") if t.strip()]
+                if topics:
+                    return topics
+        except Exception as e:
+            logger.warning(f"Could not load research_topics for {self.client_id}: {e}")
+        # ARIA internal defaults
         return [
             "AI marketing automation 2025",
             "content marketing trends this week",
