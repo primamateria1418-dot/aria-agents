@@ -457,7 +457,11 @@ async def approve_content(payload: ContentApproval, client_id: str = Depends(get
         supabase_update("content_queue", row_id=payload.content_id, data=update_data)
 
         if payload.post_immediately:
-            asyncio.create_task(asyncio.to_thread(linkedin.execute_cycle))
+            def post_for_client(cid):
+                from agents.linkedin import LinkedInAgent
+                li = LinkedInAgent(client_id=cid)
+                li.execute_cycle()
+            asyncio.create_task(asyncio.to_thread(post_for_client, client_id))
             return {"status": "approved_and_posting", "content_id": payload.content_id}
 
         return {"status": "approved", "content_id": payload.content_id}
@@ -516,7 +520,11 @@ async def post_now(content_id: str, _=Depends(verify_api_key)):
     if not content[0].get("approved"):
         raise HTTPException(status_code=400, detail="Content must be approved before posting")
 
-    asyncio.create_task(asyncio.to_thread(linkedin.execute_cycle))
+    def post_for_client(cid):
+        from agents.linkedin import LinkedInAgent
+        li = LinkedInAgent(client_id=cid)
+        li.execute_cycle()
+    asyncio.create_task(asyncio.to_thread(post_for_client, client_id))
     return {"status": "posting", "content_id": content_id, "message": "LinkedIn agent triggered"}
 
 
@@ -541,8 +549,12 @@ async def ceo_override(payload: CEOOverride, _=Depends(verify_api_key)):
     }
 
     if payload.trigger_immediately and payload.agent in agent_map:
+        def run_agent_for_client(agent_name, cid):
+            agents = get_agents(cid)
+            if agent_name in agents:
+                agents[agent_name].execute_cycle()
         asyncio.create_task(
-            asyncio.to_thread(agent_map[payload.agent].execute_cycle)
+            asyncio.to_thread(run_agent_for_client, payload.agent, client_id)
         )
         return {
             "status":  "override_issued_and_triggered",
