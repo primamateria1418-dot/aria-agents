@@ -63,7 +63,31 @@ VIBE_GUIDES = {
 class WriterAgent(BaseAgent):
     def __init__(self, client_id: str = "aria_internal"):
         super().__init__(name="writer", client_id=client_id)
-        self.brand_voice = BRAND_VOICES.get(client_id, BRAND_VOICES["aria_internal"])
+        self.brand_voice = self._get_brand_voice()
+
+    def _get_brand_voice(self) -> dict:
+        """Load brand voice from Supabase brand_profiles. Falls back to hardcoded dict."""
+        try:
+            profiles = supabase_select(
+                "brand_profiles",
+                filters={"client_id": self.client_id},
+                limit=1
+            )
+            if profiles:
+                p = profiles[0]
+                return {
+                    "name":          p.get("name", self.client_id),
+                    "tone":          p.get("tone", "Professional and direct."),
+                    "audience":      p.get("target_audience", "Business professionals"),
+                    "avoid":         p.get("avoid", ""),
+                    "linkedin_style":p.get("linkedin_style", "Short paragraphs, punchy opener, ends with question or CTA."),
+                    "email_style":   p.get("email_style", "Clear subject line, 3 paragraphs max, one CTA."),
+                    "blog_style":    p.get("blog_style", "1,500-2,000 words, SEO-optimised, H2 subheadings."),
+                }
+        except Exception as e:
+            logger.warning(f"Could not load brand_profiles for {self.client_id}: {e}")
+        # Fallback to hardcoded
+        return BRAND_VOICES.get(self.client_id, BRAND_VOICES["aria_internal"])
 
     # ═══════════════════════════════════════════════════════
     #  MAIN DAILY CYCLE
