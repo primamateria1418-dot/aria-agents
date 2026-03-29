@@ -394,17 +394,23 @@ async def submit_content_request(payload: ContentRequest, client_id: str = Depen
     })
 
     # Trigger Writer immediately for CEO requests
+    # IMPORTANT: create a per-request WriterAgent with correct client_id from JWT
     if payload.requested_by == "ceo":
+        request_data = {
+            **(row or {}),
+            "topic":        payload.topic,
+            "format":       payload.format,
+            "platform":     payload.platform,
+            "vibe":         payload.vibe or "",
+            "requested_by": payload.requested_by,
+            "id":           (row or {}).get("id"),
+            "client_id":    client_id,
+        }
+        def run_writer_for_client(cid, req):
+            w = WriterAgent(client_id=cid)
+            w._write_on_demand(req)
         asyncio.create_task(
-            asyncio.to_thread(writer._write_on_demand, {
-                **(row or {}),
-                "topic":        payload.topic,
-                "format":       payload.format,
-                "platform":     payload.platform,
-                "vibe":         payload.vibe or "",
-                "requested_by": payload.requested_by,
-                "id":           (row or {}).get("id"),
-            })
+            asyncio.to_thread(run_writer_for_client, client_id, request_data)
         )
         return {
             "status":     "triggered",
@@ -412,8 +418,11 @@ async def submit_content_request(payload: ContentRequest, client_id: str = Depen
             "request_id": (row or {}).get("id"),
         }
 
-    # For client requests — trigger Writer cycle
-    asyncio.create_task(asyncio.to_thread(writer.execute_cycle))
+    # For client requests — trigger a per-client Writer cycle
+    def run_client_writer_cycle(cid):
+        w = WriterAgent(client_id=cid)
+        w.execute_cycle()
+    asyncio.create_task(asyncio.to_thread(run_client_writer_cycle, client_id))
 
     return {
         "status":     "queued",
@@ -569,8 +578,12 @@ async def seed_evergreen(_=Depends(verify_api_key)):
     Trigger LinkedIn agent to seed the evergreen reserve.
     Called once on first deployment.
     """
-    asyncio.create_task(asyncio.to_thread(linkedin.seed_evergreen_reserve))
-    return {"status": "seeding", "message": "Writer is generating 10 evergreen posts — check evergreen_reserve table in ~60 seconds"}
+    def seed_for_client(cid):
+        from agents.linkedin import LinkedInAgent
+        li = LinkedInAgent(client_id=cid)
+        li.seed_evergreen_reserve()
+    asyncio.create_task(asyncio.to_thread(seed_for_client, client_id))
+    return {"status": "seeding", "client_id": client_id, "message": "Generating 10 evergreen posts for " + client_id + " — check evergreen_reserve table in ~60 seconds"}
 
 
 # ═══════════════════════════════════════════════════════════════════════
