@@ -325,6 +325,20 @@ async def approve_content(payload: ContentApproval, client_id: str = Depends(get
         return {"status": "rejected", "content_id": payload.content_id}
     elif payload.action == "request_changes":
         supabase_update("content_queue", row_id=payload.content_id, data={"status": "changes_requested", "ceo_note": payload.ceo_note or "", "approved": False})
+        # Trigger Writer immediately with the change request
+        note = payload.ceo_note or ""
+        def redraft(cid, content_id, change_note):
+            w = WriterAgent(client_id=cid)
+            w._write_on_demand({
+                "id": None,
+                "topic": f"Redraft content {content_id}. CEO feedback: {change_note}",
+                "format": "linkedin_post",
+                "platform": "linkedin",
+                "vibe": "",
+                "requested_by": "ceo",
+                "client_id": cid,
+            })
+        asyncio.create_task(asyncio.to_thread(redraft, client_id, payload.content_id, note))
         return {"status": "changes_requested", "content_id": payload.content_id}
     raise HTTPException(status_code=400, detail=f"Unknown action '{payload.action}'")
 
