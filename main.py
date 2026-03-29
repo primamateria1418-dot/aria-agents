@@ -712,6 +712,20 @@ async def upload_brand_asset(
     return {"status": "uploaded", "client_id": client_id, "asset_type": asset_type, "filename": file.filename}
 
 
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  BRAND PROFILE — per-client AI context
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.get("/brand/profile")
+async def get_brand_profile(client_id: str = Depends(get_client_id)):
+    """Return the brand profile for the authenticated client."""
+    profiles = supabase_select("brand_profiles", filters={"client_id": client_id}, limit=1)
+    if not profiles:
+        raise HTTPException(status_code=404, detail="Brand profile not found")
+    return profiles[0]
+
 # ── Helpers ───────────────────────────────────────────────────────────
 def _build_briefing_summary(reports, pending, hot_leads) -> str:
     parts = []
