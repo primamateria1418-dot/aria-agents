@@ -420,6 +420,88 @@ async def seed_evergreen(client_id: str = Depends(get_client_id)):
     asyncio.create_task(asyncio.to_thread(seed, client_id))
     return {"status": "seeding", "client_id": client_id, "message": f"Generating 10 evergreen posts for {client_id}"}
 
+# ── ADD THESE TWO ROUTES to main.py ──
+# Paste them directly after the /linkedin/seed-evergreen route
+# (after the seed_evergreen function, before the FACEBOOK section)
+
+# ─────────────────────────────────────────────────────────────────────
+# Route 1: GET /content/evergreen
+# Reads evergreen_reserve table for the client
+# ─────────────────────────────────────────────────────────────────────
+
+@app.get("/content/evergreen")
+async def get_evergreen_reserve(client_id: str = Depends(get_client_id)):
+    posts = supabase_select("evergreen_reserve", filters={"client_id": client_id}, limit=50)
+    return posts or []
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Route 2: POST /chat
+# CEO chat — takes {message, history} and returns a Groq-powered reply
+# Uses existing GROQ_API_KEY + brand profile for context
+# ─────────────────────────────────────────────────────────────────────
+
+class ChatMessage(BaseModel):
+    message: str
+    history: Optional[List[dict]] = []
+
+@app.post("/chat")
+async def ceo_chat(payload: ChatMessage, client_id: str = Depends(get_client_id)):
+    import httpx
+
+    groq_key = os.environ.get("GROQ_API_KEY", "")
+    model    = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+    if not groq_key:
+        return {"reply": "GROQ_API_KEY not set — cannot process chat."}
+
+    # Pull brand profile for context
+    profiles = supabase_select("brand_profiles", filters={"client_id": client_id}, limit=1)
+    profile  = profiles[0] if profiles else {}
+
+    # Pull today's briefing summary
+    today   = date.today().isoformat()
+    reports = supabase_select("reports", filters={"client_id": client_id, "cycle_date": today}, limit=5)
+    pending = supabase_select("content_queue", filters={"client_id": client_id, "status": "pending_review"}, limit=5)
+
+    system_prompt = f"""You are ARIA CEO — an autonomous AI Marketing Director for {profile.get('name', client_id)}.
+You speak with authority, brevity, and precision. You run 11 specialist agents.
+
+Brand context:
+- Tone: {profile.get('tone', 'Professional and authoritative')}
+- Audience: {profile.get('target_audience', 'B2B decision makers')}
+- Industry: {profile.get('industry', 'Technology')}
+
+Today's status:
+- Content pending approval: {len(pending)} items
+- Agent reports today: {len(reports)}
+- Date: {today}
+
+When the user asks you to write content, create a brief, trigger agents, or take action:
+- Confirm you are doing it and what they should expect
+- Be concise — 2-4 sentences max unless detail is needed
+- Never say you "can't" — route to the right action or panel"""
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in (payload.history or [])[-6:]:
+        if h.get("role") in ("user", "assistant"):
+            messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": payload.message})
+
+    try:
+        async with httpx.AsyncClient(timeout=30) as client_http:
+            res = await client_http.post(
+                "https://api.groq.com/openai/v1/chat/completions",
+                headers={"Authorization": f"Bearer {groq_key}", "Content-Type": "application/json"},
+                json={"model": model, "messages": messages, "max_tokens": 400, "temperature": 0.7}
+            )
+            data = res.json()
+            reply = data["choices"][0]["message"]["content"].strip()
+    except Exception as e:
+        logger.error(f"Chat error: {e}")
+        reply = "I encountered an issue processing your message. Please try again."
+
+    return {"reply": reply, "client_id": client_id}
 
 # ═══════════════════════════════════════════════════════════════════════
 #  FACEBOOK
