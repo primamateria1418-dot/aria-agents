@@ -212,7 +212,7 @@ Respond ONLY with a JSON array of scores (same order as input):
             return angles
 
     def _store_angle(self, angle: dict) -> dict | None:
-       row = supabase_insert("content_queue", {
+        row = supabase_insert("content_queue", {
             "client_id":    self.client_id,
             "content_type": angle.get("format", "linkedin_post"),
             "platform":     self._format_to_platform(angle.get("format", "linkedin_post")),
