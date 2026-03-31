@@ -555,20 +555,62 @@ async def update_brand_profile(payload: BrandProfileUpdate, client_id: str = Dep
     supabase_update("brand_profiles", data=updates, filters={"client_id": client_id})
     return {"status": "updated", "client_id": client_id}
 
-
 # ═══════════════════════════════════════════════════════════════════════
 #  CREA™ CREATIVE AGENT
 # ═══════════════════════════════════════════════════════════════════════
+class CREAExpandRequest(BaseModel):
+    brief: str
+    style: str = "photorealistic"
+    format: str = "linkedin"
+
+class CREASaveAssetRequest(BaseModel):
+    campaign_id: str
+    image_url: Optional[str] = None
+    image_b64: Optional[str] = None
+    prompt: str = ""
+    negative_prompt: str = ""
+    style: str = "photorealistic"
+    channel: str = "linkedin"
+
+class CREARejectRequest(BaseModel):
+    feedback: str = ""
+
+@app.get("/agents/crea/health")
+async def crea_health():
+    agent = CREAAgent()
+    return agent.health()
+
+@app.post("/agents/crea/expand-prompt")
+async def crea_expand_prompt(payload: CREAExpandRequest, client_id: str = Depends(get_client_id)):
+    try:
+        agent = CREAAgent(client_id=client_id)
+        return agent.expand_prompt(brief=payload.brief, style=payload.style, format=payload.format)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/agents/crea/save-asset")
+async def crea_save_asset(payload: CREASaveAssetRequest, client_id: str = Depends(get_client_id)):
+    try:
+        agent = CREAAgent(client_id=client_id)
+        return agent.save_asset(
+            campaign_id=payload.campaign_id, image_b64=payload.image_b64,
+            image_url=payload.image_url, prompt=payload.prompt,
+            negative_prompt=payload.negative_prompt, style=payload.style, channel=payload.channel,
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/agents/crea/generate")
 async def crea_generate(payload: CREAGenerateRequest, client_id: str = Depends(get_client_id)):
-    def run(cid, p):
-        agent = CREAAgent(client_id=cid)
-        agent.generate(campaign_id=p.campaign_id, channel=p.channel, dimensions=p.dimensions,
-                       quantity=p.quantity, override_prompt=p.override_prompt, model=p.model)
-    asyncio.create_task(asyncio.to_thread(run, client_id, payload))
-    return {"status": "generating", "campaign_id": payload.campaign_id, "channel": payload.channel,
-            "message": f"CREA™ is generating your assets. Check /agents/crea/assets/{payload.campaign_id} for results."}
+    try:
+        agent = CREAAgent(client_id=client_id)
+        result = agent.generate(campaign_id=payload.campaign_id, prompt=payload.override_prompt or "",
+                                channel=payload.channel, dimensions=payload.dimensions)
+        if not result.get("success"):
+            raise HTTPException(status_code=503, detail=result.get("error", "Generation failed"))
+        return result
+    except HTTPException: raise
+    except Exception as e: raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/agents/crea/assets/{campaign_id}")
 async def crea_assets(campaign_id: str, client_id: str = Depends(get_client_id)):
@@ -582,16 +624,9 @@ async def crea_approve(asset_id: str, client_id: str = Depends(get_client_id)):
     return {"status": "approved", "asset_id": asset_id}
 
 @app.post("/agents/crea/reject/{asset_id}")
-async def crea_reject(asset_id: str, feedback: str = "", client_id: str = Depends(get_client_id)):
-    CREAAgent(client_id=client_id).reject_asset(asset_id, feedback)
+async def crea_reject(asset_id: str, payload: CREARejectRequest, client_id: str = Depends(get_client_id)):
+    CREAAgent(client_id=client_id).reject_asset(asset_id, payload.feedback)
     return {"status": "rejected", "asset_id": asset_id}
-
-@app.get("/agents/crea/health")
-async def crea_health():
-    return {"status": "ok" if os.environ.get("FAL_API_KEY") else "degraded",
-            "fal_api_key_set": bool(os.environ.get("FAL_API_KEY")),
-            "anthropic_api_key_set": bool(os.environ.get("ANTHROPIC_API_KEY"))}
-
 
 # ═══════════════════════════════════════════════════════════════════════
 #  gstack INTAKE AGENT — Interrogative brief (gstack /office-hours)
