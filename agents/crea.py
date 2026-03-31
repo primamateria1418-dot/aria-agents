@@ -1,16 +1,16 @@
 """
 agents/crea.py
 ARIA™ — CREA™ Creative Agent
-Campaign-aware, brief-driven, quality-gated creative pipeline.
-Reads Campaign Strategy Document → builds prompt → generates via FAL.ai
-→ QA gate via Claude Haiku vision → stores to Supabase.
+ComfyUI (local via ngrok) + Groq prompt engineering.
+No FAL.ai. No Anthropic API. Groq handles prompt expansion.
+QA gate is rule-based (generation success = pass).
 OUP International Ltd, 2026
 """
 
 import os
 import json
+import time
 import logging
-import base64
 import httpx
 from datetime import datetime, timezone
 from core.base_agent import BaseAgent
@@ -18,45 +18,42 @@ from core.memory import supabase_select, supabase_insert, supabase_update
 
 logger = logging.getLogger("aria.crea")
 
-FAL_API_KEY       = os.environ.get("FAL_API_KEY", "")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "")
-GROQ_API_KEY      = os.environ.get("GROQ_API_KEY", "")
-GROQ_MODEL        = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
+GROQ_MODEL     = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
+COMFYUI_NGROK  = os.environ.get("COMFYUI_NGROK", "http://127.0.0.1:8188")
 
-# ── Channel dimension reference ───────────────────────────────────────
+# ── ComfyUI polling config ─────────────────────────────────────────────
+POLL_INTERVAL  = 3    # seconds between /history polls
+POLL_TIMEOUT   = 180  # seconds before giving up
+
+# ── Channel dimension reference ────────────────────────────────────────
 CHANNEL_DIMENSIONS = {
-    "instagram_post":    {"w": 1080, "h": 1080, "ratio": "1:1",    "notes": "Primary social format"},
-    "instagram_story":   {"w": 1080, "h": 1920, "ratio": "9:16",   "notes": "Keep text in centre 60%"},
-    "linkedin":          {"w": 1200, "h": 628,  "ratio": "1.91:1", "notes": "Professional tone"},
-    "facebook":          {"w": 1200, "h": 628,  "ratio": "1.91:1", "notes": "Same as LinkedIn"},
-    "twitter":           {"w": 1600, "h": 900,  "ratio": "16:9",   "notes": "Bold, high contrast"},
-    "banner_leaderboard":{"w": 728,  "h": 90,   "ratio": "8:1",    "notes": "Minimal text"},
-    "banner_rectangle":  {"w": 300,  "h": 250,  "ratio": "6:5",    "notes": "Most common display"},
+    "instagram_post":     {"w": 1024, "h": 1024, "ratio": "1:1",    "notes": "Primary social format"},
+    "instagram_story":    {"w": 768,  "h": 1344, "ratio": "9:16",   "notes": "Keep text in centre 60%"},
+    "linkedin":           {"w": 1216, "h": 640,  "ratio": "1.91:1", "notes": "Professional tone"},
+    "facebook":           {"w": 1216, "h": 640,  "ratio": "1.91:1", "notes": "Same as LinkedIn"},
+    "twitter":            {"w": 1344, "h": 768,  "ratio": "16:9",   "notes": "Bold, high contrast"},
+    "banner_leaderboard": {"w": 1344, "h": 768,  "ratio": "8:1",    "notes": "Minimal text"},
+    "banner_rectangle":   {"w": 768,  "h": 640,  "ratio": "6:5",    "notes": "Most common display"},
 }
 
-QA_DIMENSIONS = [
-    ("generic_composition", 6),
-    ("brand_alignment", 7),
-    ("audience_fit", 6),
-]
+# ── Groq prompt engineering system prompt ──────────────────────────────
+PROMPT_ENGINEER_SYSTEM = """You are a specialist AI image prompt engineer for advertising.
+Given a campaign brief, construct a JuggernautXL-optimised image generation prompt.
 
-QA_SYSTEM_PROMPT = """You are a senior creative director reviewing AI-generated ad creative.
-You are ruthless about quality. Your job is to catch AI-generated mediocrity before it reaches a client.
+Rules:
+- Specify art style, lighting, composition, and colour palette derived from brand params
+- Include target audience context in visual language
+- AVOID generic AI aesthetics: no centred lone subject on plain background, no stock-photo look
+- Include specific visual storytelling details, textures, environments
+- Optimise for photorealism — JuggernautXL excels at this
+- Keep positive prompt under 180 words
 
-Score the image on each dimension from 0-10 and return JSON only:
+Return JSON only — no markdown, no backticks, no preamble:
 {
-  "generic_composition": 0-10,
-  "brand_alignment": 0-10,
-  "audience_fit": 0-10,
-  "ai_artefacts": true/false,
-  "channel_fit": true/false,
-  "overall_pass": true/false,
-  "fail_reasons": [],
-  "prompt_adjustments": ""
-}
-
-Fail criteria: generic_composition < 6, brand_alignment < 7, audience_fit < 6,
-ai_artefacts = true, channel_fit = false."""
+  "positive_prompt": "...",
+  "negative_prompt": "centered subject, stock photo, generic background, AI artifacts, watermark, text overlay, oversaturated, blurry, deformed, bad anatomy, ugly, duplicate"
+}"""
 
 
 class CREAAgent(BaseAgent):
@@ -64,354 +61,407 @@ class CREAAgent(BaseAgent):
         super().__init__(name="crea", client_id=client_id)
 
     # ═══════════════════════════════════════════════════════
-    #  MAIN ENTRY — generate an asset for a campaign
+    #  HEALTH
+    # ═══════════════════════════════════════════════════════
+
+    def health(self) -> dict:
+        """Ping ComfyUI via ngrok and return status."""
+        try:
+            with httpx.Client(timeout=8) as client:
+                res = client.get(f"{COMFYUI_NGROK}/system_stats")
+                res.raise_for_status()
+                stats = res.json()
+                return {
+                    "status": "online",
+                    "ngrok_url": COMFYUI_NGROK,
+                    "comfyui": stats,
+                }
+        except Exception as e:
+            return {
+                "status": "offline",
+                "ngrok_url": COMFYUI_NGROK,
+                "error": str(e),
+                "hint": "Start ComfyUI: cd C:\\AI\\ComfyUI && python main.py, then ngrok http 8188 --url=setsuko-tabernacular-necole.ngrok-free.dev",
+            }
+
+    # ═══════════════════════════════════════════════════════
+    #  PROMPT EXPANSION (called by /agents/crea/expand-prompt)
+    # ═══════════════════════════════════════════════════════
+
+    def expand_prompt(self, brief: str, style: str = "photorealistic", format: str = "linkedin") -> dict:
+        """
+        Groq expands a short user brief into a full JuggernautXL prompt.
+        Also returns the workflow JSON ready to POST to ComfyUI.
+        """
+        dim_key  = self._resolve_dimension_key(format, None)
+        dim_info = CHANNEL_DIMENSIONS.get(dim_key, CHANNEL_DIMENSIONS["linkedin"])
+
+        positive, negative = self._groq_expand(brief, style, dim_info, format)
+
+        workflow = self._build_workflow(positive, negative, dim_info)
+
+        return {
+            "positive_prompt":  positive,
+            "negative_prompt":  negative,
+            "workflow_json":    workflow,
+            "dimensions":       dim_info,
+            "channel":          format,
+        }
+
+    # ═══════════════════════════════════════════════════════
+    #  MAIN GENERATE (backend-initiated, uses ngrok directly)
     # ═══════════════════════════════════════════════════════
 
     def generate(
         self,
         campaign_id: str,
+        prompt: str,
+        style: str = "photorealistic",
         channel: str = "linkedin",
         dimensions: str = None,
-        quantity: int = 1,
-        override_prompt: str = None,
-        model: str = "flux-pro",
-    ) -> list[dict]:
+    ) -> dict:
         """
-        Full pipeline: brief → prompt → generate → QA → final → store.
-        Returns list of asset metadata dicts.
+        Full pipeline: expand prompt → submit to ComfyUI → poll → fetch image → store.
+        Called from POST /agents/crea/generate.
+        Returns asset metadata dict.
         """
-        if not FAL_API_KEY:
-            logger.error("FAL_API_KEY not set — cannot generate images")
-            return []
-
-        # 1. Read brief
-        brief = self._get_campaign_brief(campaign_id)
-        dim_key = self._resolve_dimension_key(channel, dimensions)
+        dim_key  = self._resolve_dimension_key(channel, dimensions)
         dim_info = CHANNEL_DIMENSIONS.get(dim_key, CHANNEL_DIMENSIONS["linkedin"])
 
-        results = []
-        for i in range(quantity):
-            try:
-                result = self._generate_single(
-                    campaign_id=campaign_id,
-                    brief=brief,
-                    channel=channel,
-                    dim_info=dim_info,
-                    override_prompt=override_prompt,
-                    final_model=model,
-                )
-                results.append(result)
-            except Exception as e:
-                logger.error(f"CREA generate #{i+1} failed for {campaign_id}: {e}")
+        # 1. Expand prompt
+        positive, negative = self._groq_expand(prompt, style, dim_info, channel)
 
-        return results
+        # 2. Build workflow JSON
+        workflow = self._build_workflow(positive, negative, dim_info)
 
-    def _generate_single(
-        self,
-        campaign_id: str,
-        brief: dict,
-        channel: str,
-        dim_info: dict,
-        override_prompt: str,
-        final_model: str,
-    ) -> dict:
-        """One full pipeline iteration."""
-        # 2. Build prompt (skip if override provided)
-        if override_prompt:
-            prompt, negative_prompt = override_prompt, ""
-        else:
-            prompt, negative_prompt = self._construct_prompt(brief, channel, dim_info)
+        # 3. Submit to ComfyUI
+        prompt_id = self._comfyui_submit(workflow)
+        if not prompt_id:
+            return {"success": False, "error": "ComfyUI submission failed — is it running?"}
 
-        # 3. QA iteration loop (max 3 attempts with flux-schnell)
-        qa_result = None
-        qa_iterations = 0
-        current_prompt = prompt
-        current_negative = negative_prompt
+        # 4. Poll until done
+        filename = self._comfyui_poll(prompt_id)
+        if not filename:
+            return {"success": False, "error": "ComfyUI generation timed out or failed"}
 
-        for attempt in range(3):
-            qa_iterations += 1
-            draft_url = self._fal_generate(current_prompt, current_negative, "fal-ai/flux/schnell", dim_info)
-            if not draft_url:
-                break
+        # 5. Build image URL (ngrok viewable)
+        image_url = f"{COMFYUI_NGROK}/view?filename={filename}"
 
-            qa_result = self._qa_score(draft_url, brief, channel)
-            if qa_result.get("overall_pass"):
-                break
+        # 6. QA gate — rule-based: generation success = pass
+        qa_passed = True
+        qa_score  = {"overall_pass": True, "method": "rule_based", "reason": "Generation completed successfully"}
 
-            # Adjust prompt based on QA feedback
-            adjustments = qa_result.get("prompt_adjustments", "")
-            if adjustments:
-                current_prompt = f"{prompt}. {adjustments}"
-            logger.info(f"CREA QA fail #{attempt+1} for campaign {campaign_id}: {qa_result.get('fail_reasons')}")
+        # 7. Store to crea_assets
+        asset_id = self._store_asset(
+            campaign_id=campaign_id,
+            image_url=image_url,
+            positive=positive,
+            negative=negative,
+            channel=channel,
+            dim_info=dim_info,
+            style=style,
+            qa_score=qa_score,
+            qa_passed=qa_passed,
+        )
 
-        if not qa_result:
-            qa_result = {"overall_pass": False, "fail_reasons": ["Generation failed"], "qa_iterations": qa_iterations}
-
-        # 4. Final generation at full quality
-        if qa_result.get("overall_pass"):
-            final_url = self._fal_generate(current_prompt, current_negative, f"fal-ai/flux/{final_model.replace('flux-', '')}", dim_info)
-        else:
-            # Flag for human review — use draft URL if available
-            final_url = draft_url if 'draft_url' in dir() and draft_url else None
-            logger.warning(f"CREA: asset failed QA after 3 attempts for {campaign_id}. Flagging for human review.")
-            self.raise_flag(
-                "ceo",
-                f"CREA asset failed QA for campaign {campaign_id}. Human review required.",
-                priority="normal",
-                context={"campaign_id": campaign_id, "fail_reasons": qa_result.get("fail_reasons", [])}
-            )
-
-        # 5. Store asset metadata
-        row = supabase_insert("crea_assets", {
-            "campaign_id":      campaign_id,
-            "client_id":        self.client_id,
-            "asset_url":        final_url,
-            "prompt_used":      current_prompt,
-            "negative_prompt":  current_negative,
-            "qa_score":         json.dumps(qa_result),
-            "qa_passed":        qa_result.get("overall_pass", False),
-            "qa_iterations":    qa_iterations,
-            "generation_model": final_model,
-            "channel":          channel,
-            "dimensions":       f"{dim_info['w']}x{dim_info['h']}",
-            "status":           "draft" if qa_result.get("overall_pass") else "flagged",
-            "created_at":       datetime.now(timezone.utc).isoformat(),
-            "version":          1,
-        })
-
-        asset_id = row[0]["id"] if row else None
-        logger.info(f"CREA: asset stored — id={asset_id} passed={qa_result.get('overall_pass')} iterations={qa_iterations}")
+        logger.info(f"CREA: asset stored — id={asset_id} campaign={campaign_id}")
 
         return {
-            "asset_id":   asset_id,
-            "asset_url":  final_url,
-            "qa_passed":  qa_result.get("overall_pass", False),
-            "qa_score":   qa_result,
-            "iterations": qa_iterations,
-            "prompt":     current_prompt,
+            "success":          True,
+            "asset_id":         asset_id,
+            "image_url":        image_url,
+            "filename":         filename,
+            "prompt_id":        prompt_id,
+            "positive_prompt":  positive,
+            "negative_prompt":  negative,
+            "qa_passed":        qa_passed,
+            "qa_score":         qa_score,
+            "channel":          channel,
+            "dimensions":       f"{dim_info['w']}x{dim_info['h']}",
         }
 
     # ═══════════════════════════════════════════════════════
-    #  BRIEF — read Campaign Strategy Document
+    #  SAVE ASSET (called from dashboard after browser-side generation)
     # ═══════════════════════════════════════════════════════
 
-    def _get_campaign_brief(self, campaign_id: str) -> dict:
-        """Load campaign strategy doc + brand profile for this client."""
-        brief = {"campaign_id": campaign_id}
+    def save_asset(
+        self,
+        campaign_id: str,
+        image_b64: str = None,
+        image_url: str = None,
+        prompt: str = "",
+        negative_prompt: str = "",
+        style: str = "photorealistic",
+        channel: str = "linkedin",
+    ) -> dict:
+        """
+        Store a completed asset. Called by POST /agents/crea/save-asset.
+        Browser sends image_url (ngrok /view URL) or base64.
+        """
+        dim_key  = self._resolve_dimension_key(channel, None)
+        dim_info = CHANNEL_DIMENSIONS.get(dim_key, CHANNEL_DIMENSIONS["linkedin"])
 
-        # Try campaigns table first
-        try:
-            campaigns = supabase_select("campaigns", filters={"id": campaign_id}, limit=1)
-            if campaigns:
-                brief.update(campaigns[0])
-        except Exception as e:
-            logger.warning(f"Could not load campaign {campaign_id}: {e}")
+        qa_score = {"overall_pass": True, "method": "rule_based", "reason": "User confirmed generation"}
 
-        # Always load brand profile
-        try:
-            profiles = supabase_select("brand_profiles", filters={"client_id": self.client_id}, limit=1)
-            if profiles:
-                p = profiles[0]
-                brief["brand_name"]      = p.get("name", self.client_id)
-                brief["brand_tone"]      = p.get("tone", "Professional")
-                brief["target_audience"] = p.get("target_audience", "Business professionals")
-                brief["avoid"]           = p.get("avoid", "")
-                brief["content_goals"]   = p.get("content_goals", "Build brand authority")
-        except Exception as e:
-            logger.warning(f"Could not load brand profile for {self.client_id}: {e}")
+        asset_id = self._store_asset(
+            campaign_id=campaign_id,
+            image_url=image_url,
+            image_b64=image_b64,
+            positive=prompt,
+            negative=negative_prompt,
+            channel=channel,
+            dim_info=dim_info,
+            style=style,
+            qa_score=qa_score,
+            qa_passed=True,
+        )
 
-        return brief
+        return {"success": True, "asset_id": asset_id}
 
     # ═══════════════════════════════════════════════════════
-    #  PROMPT CONSTRUCTION (via Groq)
+    #  GROQ — PROMPT ENGINEERING
     # ═══════════════════════════════════════════════════════
 
-    def _construct_prompt(self, brief: dict, channel: str, dim_info: dict) -> tuple[str, str]:
-        """Build Flux-optimised image prompt from campaign brief using Groq."""
-        system = """You are a specialist AI image prompt engineer for advertising.
-Given a campaign brief, construct a Flux-optimised image generation prompt.
-
-Rules:
-- Specify art style, lighting, composition, and colour palette from brand params
-- Include target audience context in visual language
-- Specify channel dimensions and aspect ratio requirements
-- AVOID generic AI aesthetics: no centred lone subject on plain background, no stock-photo look
-- Include specific visual storytelling details
-- Keep it under 200 words
-
-Return JSON only:
-{
-  "positive_prompt": "...",
-  "negative_prompt": "centered subject, stock photo, generic background, AI artifacts, watermark, text overlay, oversaturated"
-}"""
-
-        user = f"""Campaign brief:
-Brand: {brief.get('brand_name', 'Unknown')}
-Tone: {brief.get('brand_tone', 'Professional')}
-Audience: {brief.get('target_audience', 'Business professionals')}
-Campaign goal: {brief.get('content_goals', 'Build brand authority')}
-Avoid: {brief.get('avoid', '')}
-Channel: {channel} ({dim_info['w']}x{dim_info['h']}px, {dim_info['ratio']} ratio)
-Notes: {dim_info['notes']}
-
-Construct the Flux image prompt now."""
+    def _groq_expand(self, brief: str, style: str, dim_info: dict, channel: str) -> tuple[str, str]:
+        """Call Groq to expand a brief into a JuggernautXL prompt."""
+        user = (
+            f"Brief: {brief}\n"
+            f"Style: {style}\n"
+            f"Channel: {channel} ({dim_info['w']}x{dim_info['h']}px, {dim_info['ratio']} ratio)\n"
+            f"Notes: {dim_info['notes']}\n\n"
+            "Expand this into a JuggernautXL image generation prompt now."
+        )
 
         try:
-            with httpx.Client(timeout=15) as client:
+            with httpx.Client(timeout=20) as client:
                 res = client.post(
                     "https://api.groq.com/openai/v1/chat/completions",
-                    headers={"Authorization": f"Bearer {GROQ_API_KEY}", "Content-Type": "application/json"},
-                    json={
-                        "model": GROQ_MODEL,
-                        "messages": [{"role": "system", "content": system}, {"role": "user", "content": user}],
-                        "max_tokens": 400,
-                        "temperature": 0.7,
-                    }
-                )
-                res.raise_for_status()
-                raw = res.json()["choices"][0]["message"]["content"].strip()
-                clean = raw.lstrip("```json").lstrip("```").rstrip("```").strip()
-                data = json.loads(clean)
-                return data["positive_prompt"], data["negative_prompt"]
-        except Exception as e:
-            logger.warning(f"Prompt construction failed: {e}. Using fallback prompt.")
-            fallback = (
-                f"Professional advertising image for {brief.get('brand_name', 'a brand')}, "
-                f"targeting {brief.get('target_audience', 'professionals')}, "
-                f"clean modern aesthetic, {dim_info['ratio']} ratio, "
-                f"high quality commercial photography style"
-            )
-            return fallback, "stock photo, generic, centered lone subject, AI artifacts, watermark"
-
-    # ═══════════════════════════════════════════════════════
-    #  FAL.ai GENERATION
-    # ═══════════════════════════════════════════════════════
-
-    def _fal_generate(self, prompt: str, negative_prompt: str, model_path: str, dim_info: dict) -> str | None:
-        """Call FAL.ai and return the image URL."""
-        try:
-            with httpx.Client(timeout=60) as client:
-                res = client.post(
-                    f"https://fal.run/{model_path}",
                     headers={
-                        "Authorization": f"Key {FAL_API_KEY}",
+                        "Authorization": f"Bearer {GROQ_API_KEY}",
                         "Content-Type": "application/json",
                     },
                     json={
-                        "prompt": prompt,
-                        "negative_prompt": negative_prompt,
-                        "image_size": {"width": dim_info["w"], "height": dim_info["h"]},
-                        "num_inference_steps": 4,  # schnell is fast
-                        "num_images": 1,
-                        "enable_safety_checker": True,
+                        "model":       GROQ_MODEL,
+                        "messages":    [
+                            {"role": "system", "content": PROMPT_ENGINEER_SYSTEM},
+                            {"role": "user",   "content": user},
+                        ],
+                        "max_tokens":  450,
+                        "temperature": 0.75,
                     }
+                )
+                res.raise_for_status()
+                raw   = res.json()["choices"][0]["message"]["content"].strip()
+                # Strip any accidental markdown fences
+                clean = raw.lstrip("```json").lstrip("```").rstrip("```").strip()
+                data  = json.loads(clean)
+                return data["positive_prompt"], data["negative_prompt"]
+
+        except Exception as e:
+            logger.warning(f"Groq prompt expansion failed: {e}. Using fallback.")
+            fallback_pos = (
+                f"Ultra-realistic professional advertising photograph, {brief}, "
+                f"{style} style, cinematic lighting, sharp focus, "
+                f"{dim_info['ratio']} aspect ratio, commercial quality, 8k"
+            )
+            fallback_neg = (
+                "centered subject, stock photo, generic background, AI artifacts, "
+                "watermark, text overlay, oversaturated, blurry, deformed, bad anatomy"
+            )
+            return fallback_pos, fallback_neg
+
+    # ═══════════════════════════════════════════════════════
+    #  COMFYUI — WORKFLOW + SUBMISSION + POLLING
+    # ═══════════════════════════════════════════════════════
+
+    def _build_workflow(self, positive: str, negative: str, dim_info: dict) -> dict:
+        """
+        Build the ComfyUI API workflow JSON for JuggernautXL Ragnarok.
+        Node IDs match standard ComfyUI SDXL workflow conventions.
+        """
+        return {
+            "4": {
+                "class_type": "CheckpointLoaderSimple",
+                "inputs": {
+                    "ckpt_name": "juggernautXL_ragnarokBy.safetensors"
+                }
+            },
+            "6": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "text": positive,
+                    "clip": ["4", 1]
+                }
+            },
+            "7": {
+                "class_type": "CLIPTextEncode",
+                "inputs": {
+                    "text": negative,
+                    "clip": ["4", 1]
+                }
+            },
+            "5": {
+                "class_type": "EmptyLatentImage",
+                "inputs": {
+                    "width":       dim_info["w"],
+                    "height":      dim_info["h"],
+                    "batch_size":  1
+                }
+            },
+            "3": {
+                "class_type": "KSampler",
+                "inputs": {
+                    "model":            ["4", 0],
+                    "positive":         ["6", 0],
+                    "negative":         ["7", 0],
+                    "latent_image":     ["5", 0],
+                    "seed":             int(time.time()),
+                    "steps":            30,
+                    "cfg":              7.0,
+                    "sampler_name":     "euler_ancestral",
+                    "scheduler":        "karras",
+                    "denoise":          1.0
+                }
+            },
+            "8": {
+                "class_type": "VAEDecode",
+                "inputs": {
+                    "samples": ["3", 0],
+                    "vae":     ["4", 2]
+                }
+            },
+            "9": {
+                "class_type": "SaveImage",
+                "inputs": {
+                    "images":       ["8", 0],
+                    "filename_prefix": f"ARIA_CREA_{int(time.time())}"
+                }
+            }
+        }
+
+    def _comfyui_submit(self, workflow: dict) -> str | None:
+        """POST workflow to ComfyUI /prompt, return prompt_id."""
+        try:
+            with httpx.Client(timeout=15) as client:
+                res = client.post(
+                    f"{COMFYUI_NGROK}/prompt",
+                    json={"prompt": workflow},
+                    headers={"Content-Type": "application/json"},
                 )
                 res.raise_for_status()
                 data = res.json()
-                images = data.get("images", [])
-                if images:
-                    return images[0].get("url")
-                logger.warning(f"FAL.ai returned no images: {data}")
-                return None
+                prompt_id = data.get("prompt_id")
+                logger.info(f"CREA: ComfyUI job submitted — prompt_id={prompt_id}")
+                return prompt_id
         except Exception as e:
-            logger.error(f"FAL.ai generation failed ({model_path}): {e}")
+            logger.error(f"CREA: ComfyUI submission failed: {e}")
             return None
 
+    def _comfyui_poll(self, prompt_id: str) -> str | None:
+        """
+        Poll GET /history/{prompt_id} every POLL_INTERVAL seconds.
+        Returns filename when done, None on timeout.
+        """
+        deadline = time.time() + POLL_TIMEOUT
+        logger.info(f"CREA: polling ComfyUI for prompt_id={prompt_id}")
+
+        while time.time() < deadline:
+            try:
+                with httpx.Client(timeout=10) as client:
+                    res = client.get(f"{COMFYUI_NGROK}/history/{prompt_id}")
+                    res.raise_for_status()
+                    history = res.json()
+
+                if prompt_id in history:
+                    outputs = history[prompt_id].get("outputs", {})
+                    # Node 9 is SaveImage
+                    node_9 = outputs.get("9", {})
+                    images = node_9.get("images", [])
+                    if images:
+                        filename = images[0].get("filename")
+                        logger.info(f"CREA: ComfyUI done — filename={filename}")
+                        return filename
+
+            except Exception as e:
+                logger.warning(f"CREA: poll error: {e}")
+
+            time.sleep(POLL_INTERVAL)
+
+        logger.error(f"CREA: ComfyUI timed out after {POLL_TIMEOUT}s for prompt_id={prompt_id}")
+        return None
+
     # ═══════════════════════════════════════════════════════
-    #  QA GATE — Claude Haiku vision scoring
+    #  SUPABASE STORAGE
     # ═══════════════════════════════════════════════════════
 
-    def _qa_score(self, image_url: str, brief: dict, channel: str) -> dict:
-        """Pass image to Claude Haiku for quality scoring."""
-        if not ANTHROPIC_API_KEY:
-            logger.warning("ANTHROPIC_API_KEY not set — skipping QA, marking as passed")
-            return {"overall_pass": True, "qa_skipped": True}
+    def _store_asset(
+        self,
+        campaign_id: str,
+        image_url: str = None,
+        image_b64: str = None,
+        positive: str = "",
+        negative: str = "",
+        channel: str = "linkedin",
+        dim_info: dict = None,
+        style: str = "photorealistic",
+        qa_score: dict = None,
+        qa_passed: bool = True,
+    ) -> str | None:
+        dim_info = dim_info or CHANNEL_DIMENSIONS["linkedin"]
+        row = supabase_insert("crea_assets", {
+            "campaign_id":     campaign_id,
+            "client_id":       self.client_id,
+            "image_url":       image_url,
+            "image_data":      image_b64,
+            "prompt_used":     positive,
+            "negative_prompt": negative,
+            "style":           style,
+            "channel":         channel,
+            "dimensions":      f"{dim_info['w']}x{dim_info['h']}",
+            "qa_score":        json.dumps(qa_score or {}),
+            "qa_passed":       qa_passed,
+            "status":          "draft",
+            "approved":        False,
+            "generation_model":"juggernautXL_ragnarok",
+            "created_at":      datetime.now(timezone.utc).isoformat(),
+        })
+        return row[0]["id"] if row else None
 
-        user_content = [
-            {
-                "type": "image",
-                "source": {"type": "url", "url": image_url},
-            },
-            {
-                "type": "text",
-                "text": (
-                    f"Evaluate this ad creative for {brief.get('brand_name', 'a brand')}.\n"
-                    f"Target audience: {brief.get('target_audience', 'business professionals')}\n"
-                    f"Channel: {channel}\n"
-                    f"Brand tone: {brief.get('brand_tone', 'Professional')}\n\n"
-                    "Score and return JSON as instructed."
-                )
-            }
-        ]
+    # ═══════════════════════════════════════════════════════
+    #  ASSET MANAGEMENT
+    # ═══════════════════════════════════════════════════════
 
-        try:
-            with httpx.Client(timeout=30) as client:
-                res = client.post(
-                    "https://api.anthropic.com/v1/messages",
-                    headers={
-                        "x-api-key": ANTHROPIC_API_KEY,
-                        "anthropic-version": "2023-06-01",
-                        "content-type": "application/json",
-                    },
-                    json={
-                        "model": "claude-haiku-4-5-20251001",
-                        "max_tokens": 500,
-                        "system": QA_SYSTEM_PROMPT,
-                        "messages": [{"role": "user", "content": user_content}],
-                    }
-                )
-                res.raise_for_status()
-                raw = res.json()["content"][0]["text"].strip()
-                clean = raw.lstrip("```json").lstrip("```").rstrip("```").strip()
-                return json.loads(clean)
-        except Exception as e:
-            logger.warning(f"QA scoring failed: {e}. Marking as passed to avoid blocking pipeline.")
-            return {"overall_pass": True, "qa_error": str(e)}
+    def get_assets(self, campaign_id: str) -> list:
+        filters = {"client_id": self.client_id}
+        if campaign_id and campaign_id != "all":
+            filters["campaign_id"] = campaign_id
+        return supabase_select("crea_assets", filters=filters, limit=50)
+
+    def approve_asset(self, asset_id: str):
+        supabase_update("crea_assets", {"status": "approved", "approved": True}, filters={"id": asset_id})
+
+    def reject_asset(self, asset_id: str, feedback: str = ""):
+        supabase_update("crea_assets", {"status": "rejected", "approved": False, "feedback": feedback}, filters={"id": asset_id})
 
     # ═══════════════════════════════════════════════════════
     #  HELPERS
     # ═══════════════════════════════════════════════════════
 
     def _resolve_dimension_key(self, channel: str, dimensions: str | None) -> str:
-        """Map channel string to a CHANNEL_DIMENSIONS key."""
         if dimensions:
-            # Try to match by dimension string e.g. "1080x1080"
             for key, val in CHANNEL_DIMENSIONS.items():
                 if f"{val['w']}x{val['h']}" == dimensions:
                     return key
         mapping = {
-            "instagram": "instagram_post",
-            "story":     "instagram_story",
-            "linkedin":  "linkedin",
-            "facebook":  "facebook",
-            "twitter":   "twitter",
-            "banner":    "banner_rectangle",
+            "instagram":  "instagram_post",
+            "story":      "instagram_story",
+            "linkedin":   "linkedin",
+            "facebook":   "facebook",
+            "twitter":    "twitter",
+            "banner":     "banner_rectangle",
         }
         return mapping.get(channel.lower(), "linkedin")
 
-    def get_assets(self, campaign_id: str) -> list:
-        return supabase_select("crea_assets", filters={"campaign_id": campaign_id, "client_id": self.client_id}, limit=50)
-
-    def approve_asset(self, asset_id: str):
-        supabase_update("crea_assets", {"status": "approved"}, filters={"id": asset_id})
-
-    def reject_asset(self, asset_id: str, feedback: str = ""):
-        supabase_update("crea_assets", {"status": "rejected", "feedback": feedback}, filters={"id": asset_id})
-
     def run(self):
-        """Scheduled run — check for pending campaign briefs and generate assets."""
-        try:
-            pending = supabase_select(
-                "campaigns",
-                filters={"client_id": self.client_id, "status": "brief_ready"},
-                limit=5
-            )
-            for campaign in pending:
-                self._log_action(f"Auto-generating assets for campaign: {campaign.get('id')}")
-                self.generate(
-                    campaign_id=campaign["id"],
-                    channel="linkedin",
-                    quantity=1,
-                )
-        except Exception as e:
-            logger.error(f"CREAAgent.run failed for {self.client_id}: {e}")
+        """Scheduled run — CREA is manual-only. No-op."""
+        logger.info("CREAAgent.run called — CREA is manual-only, skipping.")
