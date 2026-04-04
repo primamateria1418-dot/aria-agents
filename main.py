@@ -63,26 +63,37 @@ def get_agents(client_id: str):
 
 CLIENT_ID = os.environ.get("CLIENT_ID", "aria_internal")
 jamie     = JAMIEHunter()
-research  = ResearchAgent(client_id=CLIENT_ID)
-writer    = WriterAgent(client_id=CLIENT_ID)
-reporting = ReportingAgent(client_id=CLIENT_ID)
-linkedin  = LinkedInAgent(client_id=CLIENT_ID)
 
 scheduler = AsyncIOScheduler()
 
+def _run_all_clients(agent_name: str):
+    """Run an agent cycle for every active client."""
+    try:
+        clients = supabase_select("clients", filters={"active": True}, limit=20)
+        for client in clients:
+            cid = client["client_id"]
+            try:
+                agents = get_agents(cid)
+                if agent_name in agents:
+                    logger.info(f"Scheduler: running {agent_name} for {cid}")
+                    agents[agent_name].execute_cycle()
+            except Exception as e:
+                logger.error(f"Scheduler: {agent_name} failed for {cid}: {e}")
+    except Exception as e:
+        logger.error(f"Scheduler: _run_all_clients failed: {e}")
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"ARIA starting — client: {CLIENT_ID}")
-    scheduler.add_job(lambda: jamie.execute_cycle(),     IntervalTrigger(minutes=30),                        id="jamie",     replace_existing=True)
-    scheduler.add_job(lambda: research.execute_cycle(),  CronTrigger(hour=6, minute=0),                      id="research",  replace_existing=True)
-    scheduler.add_job(lambda: writer.execute_cycle(),    CronTrigger(hour=7, minute=0),                      id="writer",    replace_existing=True)
-    scheduler.add_job(lambda: linkedin.execute_cycle(),  CronTrigger(hour=12, minute=0),                     id="linkedin",  replace_existing=True)
-    scheduler.add_job(lambda: reporting.execute_cycle(), CronTrigger(day_of_week="mon", hour=7, minute=0),   id="reporting", replace_existing=True)
+    logger.info(f"ARIA starting — default client: {CLIENT_ID}")
+    scheduler.add_job(lambda: jamie.execute_cycle(),              IntervalTrigger(minutes=30),                      id="jamie",     replace_existing=True)
+    scheduler.add_job(lambda: _run_all_clients("research"),       CronTrigger(hour=6,  minute=0),                   id="research",  replace_existing=True)
+    scheduler.add_job(lambda: _run_all_clients("writer"),         CronTrigger(hour=7,  minute=0),                   id="writer",    replace_existing=True)
+    scheduler.add_job(lambda: _run_all_clients("linkedin"),       CronTrigger(hour=12, minute=0),                   id="linkedin",  replace_existing=True)
+    scheduler.add_job(lambda: _run_all_clients("reporting"),      CronTrigger(day_of_week="mon", hour=7, minute=0), id="reporting", replace_existing=True)
     scheduler.start()
-    logger.info("Scheduler: Research 6am · Writer 7am · LinkedIn 12pm · Reporting Mon 7am")
+    logger.info("Scheduler: Research 6am · Writer 7am · LinkedIn 12pm · Reporting Mon 7am — ALL CLIENTS")
     yield
     scheduler.shutdown()
-
 app = FastAPI(title="ARIA™ Orchestrator", description="OUP International Ltd", version="4.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
