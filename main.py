@@ -38,7 +38,6 @@ from core.memory import supabase_select, supabase_insert, supabase_update
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(name)s] %(message)s")
 logger = logging.getLogger("aria.main")
 
-# ── JWT Config ────────────────────────────────────────────────────────
 JWT_SECRET = os.environ.get("JWT_SECRET", "aria-jwt-secret-change-in-production")
 JWT_ALGO   = "HS256"
 
@@ -52,7 +51,6 @@ def decode_client_token(token: str) -> str:
     except Exception:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
-# ── Agent factory ─────────────────────────────────────────────────────
 def get_agents(client_id: str):
     return {
         "jamie":     JAMIEHunter(),
@@ -420,26 +418,10 @@ async def seed_evergreen(client_id: str = Depends(get_client_id)):
     asyncio.create_task(asyncio.to_thread(seed, client_id))
     return {"status": "seeding", "client_id": client_id, "message": f"Generating 10 evergreen posts for {client_id}"}
 
-# ── ADD THESE TWO ROUTES to main.py ──
-# Paste them directly after the /linkedin/seed-evergreen route
-# (after the seed_evergreen function, before the FACEBOOK section)
-
-# ─────────────────────────────────────────────────────────────────────
-# Route 1: GET /content/evergreen
-# Reads evergreen_reserve table for the client
-# ─────────────────────────────────────────────────────────────────────
-
 @app.get("/content/evergreen")
 async def get_evergreen_reserve(client_id: str = Depends(get_client_id)):
     posts = supabase_select("evergreen_reserve", filters={"client_id": client_id}, limit=50)
     return posts or []
-
-
-# ─────────────────────────────────────────────────────────────────────
-# Route 2: POST /chat
-# CEO chat — takes {message, history} and returns a Groq-powered reply
-# Uses existing GROQ_API_KEY + brand profile for context
-# ─────────────────────────────────────────────────────────────────────
 
 class ChatMessage(BaseModel):
     message: str
@@ -448,46 +430,34 @@ class ChatMessage(BaseModel):
 @app.post("/chat")
 async def ceo_chat(payload: ChatMessage, client_id: str = Depends(get_client_id)):
     import httpx
-
     groq_key = os.environ.get("GROQ_API_KEY", "")
     model    = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
-
     if not groq_key:
         return {"reply": "GROQ_API_KEY not set — cannot process chat."}
-
-    # Pull brand profile for context
     profiles = supabase_select("brand_profiles", filters={"client_id": client_id}, limit=1)
     profile  = profiles[0] if profiles else {}
-
-    # Pull today's briefing summary
     today   = date.today().isoformat()
     reports = supabase_select("reports", filters={"client_id": client_id, "cycle_date": today}, limit=5)
     pending = supabase_select("content_queue", filters={"client_id": client_id, "status": "pending_review"}, limit=5)
-
     system_prompt = f"""You are ARIA CEO — an autonomous AI Marketing Director for {profile.get('name', client_id)}.
 You speak with authority, brevity, and precision. You run 11 specialist agents.
-
 Brand context:
 - Tone: {profile.get('tone', 'Professional and authoritative')}
 - Audience: {profile.get('target_audience', 'B2B decision makers')}
 - Industry: {profile.get('industry', 'Technology')}
-
 Today's status:
 - Content pending approval: {len(pending)} items
 - Agent reports today: {len(reports)}
 - Date: {today}
-
 When the user asks you to write content, create a brief, trigger agents, or take action:
 - Confirm you are doing it and what they should expect
 - Be concise — 2-4 sentences max unless detail is needed
 - Never say you "can't" — route to the right action or panel"""
-
     messages = [{"role": "system", "content": system_prompt}]
     for h in (payload.history or [])[-6:]:
         if h.get("role") in ("user", "assistant"):
             messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": payload.message})
-
     try:
         async with httpx.AsyncClient(timeout=30) as client_http:
             res = await client_http.post(
@@ -500,8 +470,8 @@ When the user asks you to write content, create a brief, trigger agents, or take
     except Exception as e:
         logger.error(f"Chat error: {e}")
         reply = "I encountered an issue processing your message. Please try again."
-
     return {"reply": reply, "client_id": client_id}
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  FACEBOOK
@@ -555,9 +525,11 @@ async def update_brand_profile(payload: BrandProfileUpdate, client_id: str = Dep
     supabase_update("brand_profiles", data=updates, filters={"client_id": client_id})
     return {"status": "updated", "client_id": client_id}
 
+
 # ═══════════════════════════════════════════════════════════════════════
 #  CREA™ CREATIVE AGENT
 # ═══════════════════════════════════════════════════════════════════════
+
 class CREAExpandRequest(BaseModel):
     brief: str
     style: str = "photorealistic"
@@ -574,6 +546,9 @@ class CREASaveAssetRequest(BaseModel):
 
 class CREARejectRequest(BaseModel):
     feedback: str = ""
+
+class ComfyUISubmitRequest(BaseModel):
+    workflow: dict
 
 @app.get("/agents/crea/health")
 async def crea_health():
@@ -628,8 +603,40 @@ async def crea_reject(asset_id: str, payload: CREARejectRequest, client_id: str 
     CREAAgent(client_id=client_id).reject_asset(asset_id, payload.feedback)
     return {"status": "rejected", "asset_id": asset_id}
 
+@app.post("/agents/crea/comfyui-submit")
+async def comfyui_submit(payload: ComfyUISubmitRequest, client_id: str = Depends(get_client_id)):
+    """Proxy: submit workflow to ComfyUI via ngrok. Avoids browser CORS."""
+    import httpx
+    ngrok = os.environ.get("COMFYUI_NGROK", "")
+    if not ngrok:
+        raise HTTPException(status_code=503, detail="COMFYUI_NGROK not set on Render")
+    try:
+        async with httpx.AsyncClient(timeout=15) as c:
+            res = await c.post(f"{ngrok}/prompt", json={"prompt": payload.workflow},
+                               headers={"Content-Type": "application/json"})
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"ComfyUI unreachable: {str(e)}")
+
+@app.get("/agents/crea/comfyui-history/{prompt_id}")
+async def comfyui_history(prompt_id: str, client_id: str = Depends(get_client_id)):
+    """Proxy: poll ComfyUI history via ngrok. Avoids browser CORS."""
+    import httpx
+    ngrok = os.environ.get("COMFYUI_NGROK", "")
+    if not ngrok:
+        raise HTTPException(status_code=503, detail="COMFYUI_NGROK not set on Render")
+    try:
+        async with httpx.AsyncClient(timeout=10) as c:
+            res = await c.get(f"{ngrok}/history/{prompt_id}")
+            res.raise_for_status()
+            return res.json()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=f"ComfyUI unreachable: {str(e)}")
+
+
 # ═══════════════════════════════════════════════════════════════════════
-#  gstack INTAKE AGENT — Interrogative brief (gstack /office-hours)
+#  INTAKE AGENT
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.post("/intake/brief")
@@ -637,24 +644,22 @@ async def intake_brief(payload: IntakeBriefRequest, client_id: str = Depends(get
     required = ["business_problem", "target_audience_detail", "success_30_days",
                 "success_90_days", "already_tried", "single_most_important_outcome"]
     missing = [f for f in required if not getattr(payload, f, None)]
-
     if missing:
         return {
             "status": "questions_required",
             "campaign_name": payload.campaign_name,
             "message": "ARIA™ interrogates every brief before executing. Answer these six questions first.",
             "questions": [
-                {"field": "business_problem",              "question": "What is the actual business problem — not the stated request? What outcome would change the business?"},
-                {"field": "target_audience_detail",        "question": "Who is the target audience, specifically? Where do they live online? What do they read and trust?"},
-                {"field": "success_30_days",               "question": "What does success look like in 30 days? Give a measurable outcome."},
-                {"field": "success_90_days",               "question": "What does success look like in 90 days? Give a measurable outcome."},
-                {"field": "already_tried",                 "question": "What has already been tried for this problem, and why did it fail?"},
-                {"field": "constraints",                   "question": "What constraints exist — brand, compliance, budget, tone, channels?"},
+                {"field": "business_problem",              "question": "What is the actual business problem — not the stated request?"},
+                {"field": "target_audience_detail",        "question": "Who is the target audience, specifically?"},
+                {"field": "success_30_days",               "question": "What does success look like in 30 days?"},
+                {"field": "success_90_days",               "question": "What does success look like in 90 days?"},
+                {"field": "already_tried",                 "question": "What has already been tried, and why did it fail?"},
+                {"field": "constraints",                   "question": "What constraints exist — brand, compliance, budget, tone?"},
                 {"field": "single_most_important_outcome", "question": "If this campaign achieves only one thing, what must it be?"},
             ],
-            "instruction": "Resubmit to POST /intake/brief with all fields completed to generate your Campaign Strategy Document."
+            "instruction": "Resubmit to POST /intake/brief with all fields completed."
         }
-
     strategy_doc = {
         "client_id": client_id, "campaign_name": payload.campaign_name,
         "raw_brief": payload.raw_brief, "business_problem": payload.business_problem,
@@ -666,14 +671,13 @@ async def intake_brief(payload: IntakeBriefRequest, client_id: str = Depends(get
     }
     row = supabase_insert("campaigns", strategy_doc)
     campaign_id = row[0]["id"] if row else None
-    logger.info(f"Intake Agent: Campaign Strategy Document created — {payload.campaign_name} for {client_id}")
     return {
         "status": "strategy_document_created", "campaign_id": campaign_id,
         "campaign_name": payload.campaign_name,
-        "message": "Campaign Strategy Document saved. All ARIA agents will reference this for the campaign.",
+        "message": "Campaign Strategy Document saved.",
         "next_steps": [
-            f"POST /agents/crea/generate with campaign_id={campaign_id} to generate visual assets",
-            f"POST /content/request with topic referencing campaign_id={campaign_id} for written content",
+            f"POST /agents/crea/generate with campaign_id={campaign_id}",
+            f"POST /content/request with topic referencing campaign_id={campaign_id}",
         ]
     }
 
