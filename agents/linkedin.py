@@ -237,20 +237,30 @@ class LinkedInAgent(BaseAgent):
                     generated += 1
         self._log_outcome(f"Evergreen reserve seeded — {generated} posts")
 
-    def _generate_evergreen_post(self, vibe: str, vibe_desc: str) -> str | None:
-        prompt = f"""Write a LinkedIn post for ARIA™ — an AI marketing agency.
+def _generate_evergreen_post(self, vibe: str, vibe_desc: str) -> str | None:
+    profiles = supabase_select("brand_profiles", filters={"client_id": self.client_id}, limit=1)
+    profile  = profiles[0] if profiles else {}
+    brand_name    = profile.get("name", self.client_id)
+    tone          = profile.get("tone", "Confident, direct, intelligent. No fluff.")
+    audience      = profile.get("target_audience", "B2B decision makers")
+    linkedin_style = profile.get("linkedin_style", "Short paragraphs. Punchy opener. 2 hashtags max. Ends with question or CTA.")
+    avoid         = profile.get("avoid", "")
+
+    avoid_line = f"Avoid: {avoid}" if avoid else ""
+
+    prompt = f"""Write a LinkedIn post for {brand_name}.
 Vibe: {vibe} — {vibe_desc}
-Brand voice: Confident, direct, intelligent. No fluff.
-Audience: Startup founders, B2B SaaS, marketing leaders.
-Style: Short paragraphs. Punchy opener. 2 hashtags max. Ends with question or CTA.
+Brand voice: {tone}
+Audience: {audience}
+Style: {linkedin_style}
+{avoid_line}
 Length: 150-280 words. EVERGREEN — no specific dates or current events.
 Write ONLY the post."""
-        try:
-            return call_llm(prompt, max_tokens=400, temperature=0.85)
-        except Exception as e:
-            logger.error(f"Evergreen generation failed [{vibe}]: {e}")
-            return None
-
+    try:
+        return call_llm(prompt, max_tokens=400, temperature=0.85)
+    except Exception as e:
+        logger.error(f"Evergreen generation failed [{vibe}]: {e}")
+        return None
 
 # ── Route management helpers (used by main.py endpoints) ─────────────
 
