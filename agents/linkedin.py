@@ -237,7 +237,7 @@ class LinkedInAgent(BaseAgent):
                     generated += 1
         self._log_outcome(f"Evergreen reserve seeded — {generated} posts")
 
-def _generate_evergreen_post(self, vibe: str, vibe_desc: str) -> str | None:
+    def _generate_evergreen_post(self, vibe: str, vibe_desc: str) -> str | None:
     profiles = supabase_select("brand_profiles", filters={"client_id": self.client_id}, limit=1)
     profile  = profiles[0] if profiles else {}
     brand_name    = profile.get("name", self.client_id)
