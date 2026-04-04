@@ -94,6 +94,7 @@ async def lifespan(app: FastAPI):
     logger.info("Scheduler: Research 6am · Writer 7am · LinkedIn 12pm · Reporting Mon 7am — ALL CLIENTS")
     yield
     scheduler.shutdown()
+
 app = FastAPI(title="ARIA™ Orchestrator", description="OUP International Ltd", version="4.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
 
@@ -623,8 +624,14 @@ async def comfyui_submit(payload: ComfyUISubmitRequest, client_id: str = Depends
         raise HTTPException(status_code=503, detail="COMFYUI_NGROK not set on Render")
     try:
         async with httpx.AsyncClient(timeout=15) as c:
-            res = await c.post(f"{ngrok}/prompt", json={"prompt": payload.workflow},
-                               headers={"Content-Type": "application/json"})
+            res = await c.post(
+                f"{ngrok}/prompt",
+                json={"prompt": payload.workflow},
+                headers={
+                    "Content-Type": "application/json",
+                    "ngrok-skip-browser-warning": "true",
+                }
+            )
             res.raise_for_status()
             return res.json()
     except Exception as e:
@@ -639,7 +646,10 @@ async def comfyui_history(prompt_id: str, client_id: str = Depends(get_client_id
         raise HTTPException(status_code=503, detail="COMFYUI_NGROK not set on Render")
     try:
         async with httpx.AsyncClient(timeout=10) as c:
-            res = await c.get(f"{ngrok}/history/{prompt_id}")
+            res = await c.get(
+                f"{ngrok}/history/{prompt_id}",
+                headers={"ngrok-skip-browser-warning": "true"}
+            )
             res.raise_for_status()
             return res.json()
     except Exception as e:
