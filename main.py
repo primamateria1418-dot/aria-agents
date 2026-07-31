@@ -332,6 +332,8 @@ class CREAGenerateRequest(BaseModel):
     dimensions: Optional[str] = None
     quantity: int = 1
     override_prompt: Optional[str] = None
+    base_image_b64: Optional[str] = None
+    denoise: Optional[float] = None
 
 class CREAExpandRequest(BaseModel):
     brief: str
@@ -1079,8 +1081,12 @@ async def crea_save_asset(payload: CREASaveAssetRequest, client_id: str = Depend
 @app.post("/agents/crea/generate")
 async def crea_generate(payload: CREAGenerateRequest, client_id: str = Depends(get_client_id)):
     from agents.crea import CREAAgent
-    result = CREAAgent(client_id=client_id).generate(campaign_id=payload.campaign_id, prompt=payload.override_prompt or "",
-        channel=payload.channel, dimensions=payload.dimensions)
+    kwargs = {"campaign_id": payload.campaign_id, "prompt": payload.override_prompt or "",
+        "channel": payload.channel, "dimensions": payload.dimensions,
+        "base_image_b64": payload.base_image_b64}
+    if payload.denoise is not None:
+        kwargs["denoise"] = payload.denoise
+    result = CREAAgent(client_id=client_id).generate(**kwargs)
     if not result.get("success"):
         raise HTTPException(status_code=503, detail=result.get("error", "Generation failed"))
     return result
