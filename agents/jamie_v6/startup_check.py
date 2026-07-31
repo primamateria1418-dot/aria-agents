@@ -25,6 +25,7 @@ import os
 import sys
 import subprocess
 import requests
+from datetime import datetime
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -166,6 +167,56 @@ def check_supabase() -> CheckResult:
         return CheckResult("Supabase", False, f"Network error reaching Supabase: {e}")
 
 
+def push_status_to_supabase(results: list):
+    """
+    Push each check result to a `system_status` table in Supabase so
+    the Render dashboard can display live tool health instead of you
+    having to watch this terminal.
+
+    Expected table schema (create once in Supabase SQL editor):
+
+        create table system_status (
+            tool_name text primary key,
+            ok boolean not null,
+            detail text,
+            checked_at timestamptz not null default now()
+        );
+
+    Uses upsert on tool_name so the dashboard always shows the latest
+    check, not a growing history table.
+    """
+    url = os.environ.get("SUPABASE_URL", "")
+    key = os.environ.get("SUPABASE_KEY", "")
+    if not url or not key:
+        print("⚠️  Skipping Supabase status push — SUPABASE_URL/KEY not set.")
+        return
+
+    endpoint = f"{url}/rest/v1/system_status"
+    headers = {
+        "apikey": key,
+        "Authorization": f"Bearer {key}",
+        "Content-Type": "application/json",
+        "Prefer": "resolution=merge-duplicates",  # upsert on primary key
+    }
+    rows = [
+        {
+            "tool_name": r.name,
+            "ok": r.ok,
+            "detail": r.detail,
+            "checked_at": datetime.utcnow().isoformat(),
+        }
+        for r in results
+    ]
+    try:
+        res = requests.post(endpoint, headers=headers, json=rows, timeout=10)
+        if res.status_code in (200, 201, 204):
+            print("📡 Status pushed to Supabase — visible on the dashboard now.")
+        else:
+            print(f"⚠️  Supabase status push failed: HTTP {res.status_code} — {res.text[:200]}")
+    except requests.exceptions.RequestException as e:
+        print(f"⚠️  Supabase status push failed: {e}")
+
+
 def run_all_checks() -> list:
     checks = [
         check_env_vars,
@@ -197,6 +248,7 @@ def print_report(results: list):
 def main():
     results = run_all_checks()
     print_report(results)
+    push_status_to_supabase(results)
 
     all_ok = all(r.ok for r in results)
 
