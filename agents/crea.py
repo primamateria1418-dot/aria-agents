@@ -1,15 +1,18 @@
 """
 agents/crea.py
 ARIA™ — CREA™ Creative Agent
-ComfyUI (local via ngrok) + Groq prompt engineering.
+ComfyUI (local via ngrok, Flux.1 Dev) + Groq prompt engineering.
 No FAL.ai. No Anthropic API. Groq handles prompt expansion.
 QA gate is rule-based (generation success = pass).
+Expand + generate now happen in one call (generate()) so the frontend gets
+back a real image_url instead of just an expanded prompt.
 OUP International Ltd, 2026
 """
 
 import os
 import json
 import time
+import base64
 import logging
 import httpx
 from datetime import datetime, timezone
@@ -21,6 +24,15 @@ logger = logging.getLogger("aria.crea")
 GROQ_API_KEY   = os.environ.get("GROQ_API_KEY", "")
 GROQ_MODEL     = os.environ.get("GROQ_MODEL", "llama-3.3-70b-versatile")
 COMFYUI_NGROK  = os.environ.get("COMFYUI_NGROK", "http://127.0.0.1:8188")
+
+# Flux Dev model filenames — must match what's actually in ComfyUI's models
+# folders on the gmtek box. Confirmed with Luke: flux1-dev.safetensors,
+# t5xxl_fp16 + clip_l text encoders. VAE filename (ae.safetensors) is the
+# standard BFL release name — verify this matches if generation fails.
+FLUX_UNET_NAME   = os.environ.get("FLUX_UNET_NAME", "flux1-dev.safetensors")
+FLUX_CLIP_T5     = os.environ.get("FLUX_CLIP_T5", "t5xxl_fp16.safetensors")
+FLUX_CLIP_L      = os.environ.get("FLUX_CLIP_L", "clip_l.safetensors")
+FLUX_VAE_NAME    = os.environ.get("FLUX_VAE_NAME", "ae.safetensors")
 
 POLL_INTERVAL  = 3
 POLL_TIMEOUT   = 180
@@ -36,15 +48,17 @@ CHANNEL_DIMENSIONS = {
 }
 
 PROMPT_ENGINEER_SYSTEM = """You are a specialist AI image prompt engineer for advertising.
-Given a campaign brief, construct a JuggernautXL-optimised image generation prompt.
+Given a campaign brief, construct a Flux.1 Dev-optimised image generation prompt.
 
 Rules:
 - Specify art style, lighting, composition, and colour palette derived from brand params
 - Include target audience context in visual language
 - AVOID generic AI aesthetics: no centred lone subject on plain background, no stock-photo look
 - Include specific visual storytelling details, textures, environments
-- Optimise for photorealism — JuggernautXL excels at this
+- Optimise for photorealism — Flux.1 Dev excels at this
 - Keep positive prompt under 180 words
+- Flux does not use a real negative prompt (no classifier-free negative guidance at cfg 1.0) —
+  still return one for logging/QA purposes, phrased as things to avoid in the composition
 
 Return JSON only — no markdown, no backticks, no preamble:
 {
@@ -73,6 +87,9 @@ class CREAAgent(BaseAgent):
             }
 
     def expand_prompt(self, brief: str, style: str = "photorealistic", format: str = "linkedin") -> dict:
+        """Prompt-engineering preview only — does NOT generate an image.
+        Kept for backward compatibility; the dashboard's Step 1→2 flow now
+        calls generate() directly so it gets a real image_url back."""
         dim_key  = self._resolve_dimension_key(format, None)
         dim_info = CHANNEL_DIMENSIONS.get(dim_key, CHANNEL_DIMENSIONS["linkedin"])
         positive, negative = self._groq_expand(brief, style, dim_info, format)
@@ -85,11 +102,27 @@ class CREAAgent(BaseAgent):
             "channel":         format,
         }
 
-    def generate(self, campaign_id: str, prompt: str, style: str = "photorealistic", channel: str = "linkedin", dimensions: str = None) -> dict:
+    def generate(self, campaign_id: str, prompt: str, style: str = "photorealistic", channel: str = "linkedin",
+                 dimensions: str = None, base_image_b64: str = None, denoise: float = 0.75) -> dict:
+        """Expand the brief via Groq and generate via ComfyUI/Flux in one call.
+        If base_image_b64 is provided, runs as image-to-image at the given
+        denoise strength (0.0 = ignore prompt entirely, 1.0 = ignore base image
+        entirely) so a client's own reference photo can be used as a base."""
         dim_key  = self._resolve_dimension_key(channel, dimensions)
         dim_info = CHANNEL_DIMENSIONS.get(dim_key, CHANNEL_DIMENSIONS["linkedin"])
         positive, negative = self._groq_expand(prompt, style, dim_info, channel)
-        workflow  = self._build_workflow(positive, negative, dim_info)
+
+        base_filename = None
+        if base_image_b64:
+            base_filename = self._comfyui_upload_image(base_image_b64)
+            if not base_filename:
+                return {"success": False, "error": "Base image upload to ComfyUI failed"}
+
+        workflow = self._build_workflow(
+            positive, negative, dim_info,
+            base_image_filename=base_filename,
+            denoise=denoise if base_filename else 1.0,
+        )
         prompt_id = self._comfyui_submit(workflow)
         if not prompt_id:
             return {"success": False, "error": "ComfyUI submission failed — is it running?"}
@@ -111,6 +144,7 @@ class CREAAgent(BaseAgent):
             "positive_prompt": positive, "negative_prompt": negative,
             "qa_passed": qa_passed, "qa_score": qa_score,
             "channel": channel, "dimensions": f"{dim_info['w']}x{dim_info['h']}",
+            "used_base_image": bool(base_filename),
         }
 
     def save_asset(self, campaign_id: str, image_b64: str = None, image_url: str = None,
@@ -129,7 +163,7 @@ class CREAAgent(BaseAgent):
         user = (
             f"Brief: {brief}\nStyle: {style}\n"
             f"Channel: {channel} ({dim_info['w']}x{dim_info['h']}px, {dim_info['ratio']} ratio)\n"
-            f"Notes: {dim_info['notes']}\n\nExpand this into a JuggernautXL image generation prompt now."
+            f"Notes: {dim_info['notes']}\n\nExpand this into a Flux.1 Dev image generation prompt now."
         )
         try:
             with httpx.Client(timeout=20) as client:
@@ -153,20 +187,58 @@ class CREAAgent(BaseAgent):
                 "centered subject, stock photo, generic background, AI artifacts, watermark, text overlay, oversaturated, blurry, deformed, bad anatomy"
             )
 
-    def _build_workflow(self, positive: str, negative: str, dim_info: dict) -> dict:
-        return {
-            "4": {"class_type": "CheckpointLoaderSimple", "inputs": {"ckpt_name": "juggernautXL_ragnarokBy.safetensors"}},
-            "6": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["4", 1]}},
-            "7": {"class_type": "CLIPTextEncode", "inputs": {"text": negative, "clip": ["4", 1]}},
-            "5": {"class_type": "EmptyLatentImage", "inputs": {"width": dim_info["w"], "height": dim_info["h"], "batch_size": 1}},
-            "3": {"class_type": "KSampler", "inputs": {
-                "model": ["4", 0], "positive": ["6", 0], "negative": ["7", 0], "latent_image": ["5", 0],
-                "seed": int(time.time()), "steps": 30, "cfg": 7.0, "sampler_name": "euler_ancestral",
-                "scheduler": "karras", "denoise": 1.0
-            }},
-            "8": {"class_type": "VAEDecode", "inputs": {"samples": ["3", 0], "vae": ["4", 2]}},
-            "9": {"class_type": "SaveImage", "inputs": {"images": ["8", 0], "filename_prefix": f"ARIA_CREA_{int(time.time())}"}}
+    def _build_workflow(self, positive: str, negative: str, dim_info: dict,
+                         base_image_filename: str = None, denoise: float = 1.0) -> dict:
+        """Flux.1 Dev graph. Flux uses a UNETLoader + DualCLIPLoader + VAELoader
+        trio rather than a single SDXL-style checkpoint, and runs at cfg=1.0
+        with guidance handled by a separate FluxGuidance node — real negative
+        prompting isn't a thing here, so the negative slot is a zeroed-out
+        conditioning to satisfy KSampler's required input.
+        When base_image_filename is set, swaps EmptyLatentImage for
+        LoadImage → VAEEncode (img2img) at the given denoise strength."""
+        workflow = {
+            "1": {"class_type": "UNETLoader", "inputs": {"unet_name": FLUX_UNET_NAME, "weight_dtype": "default"}},
+            "2": {"class_type": "DualCLIPLoader", "inputs": {"clip_name1": FLUX_CLIP_T5, "clip_name2": FLUX_CLIP_L, "type": "flux"}},
+            "3": {"class_type": "VAELoader", "inputs": {"vae_name": FLUX_VAE_NAME}},
+            "4": {"class_type": "CLIPTextEncode", "inputs": {"text": positive, "clip": ["2", 0]}},
+            "5": {"class_type": "FluxGuidance", "inputs": {"conditioning": ["4", 0], "guidance": 3.5}},
+            "6": {"class_type": "ConditioningZeroOut", "inputs": {"conditioning": ["4", 0]}},
+            "9": {"class_type": "VAEDecode", "inputs": {"samples": ["8", 0], "vae": ["3", 0]}},
+            "10": {"class_type": "SaveImage", "inputs": {"images": ["9", 0], "filename_prefix": f"LUIN_CREA_{int(time.time())}"}},
         }
+
+        if base_image_filename:
+            workflow["11"] = {"class_type": "LoadImage", "inputs": {"image": base_image_filename}}
+            workflow["7"]  = {"class_type": "VAEEncode", "inputs": {"pixels": ["11", 0], "vae": ["3", 0]}}
+        else:
+            workflow["7"] = {"class_type": "EmptyLatentImage", "inputs": {"width": dim_info["w"], "height": dim_info["h"], "batch_size": 1}}
+            denoise = 1.0
+
+        workflow["8"] = {"class_type": "KSampler", "inputs": {
+            "model": ["1", 0], "positive": ["5", 0], "negative": ["6", 0], "latent_image": ["7", 0],
+            "seed": int(time.time()), "steps": 20, "cfg": 1.0,
+            "sampler_name": "euler", "scheduler": "simple", "denoise": denoise,
+        }}
+
+        return workflow
+
+    def _comfyui_upload_image(self, image_b64: str) -> str | None:
+        """Uploads a base64 image to ComfyUI's /upload/image endpoint so it can
+        be referenced by filename in a LoadImage node. Strips a data URL prefix
+        (e.g. 'data:image/png;base64,') if present."""
+        try:
+            raw_b64 = image_b64.split(",")[-1] if "," in image_b64 else image_b64
+            image_bytes = base64.b64decode(raw_b64)
+            files = {"image": (f"crea_upload_{int(time.time())}.png", image_bytes, "image/png")}
+            with httpx.Client(timeout=30) as client:
+                res = client.post(f"{COMFYUI_NGROK}/upload/image", files=files, data={"overwrite": "true"})
+                res.raise_for_status()
+                name = res.json().get("name")
+                logger.info(f"CREA: base image uploaded to ComfyUI — name={name}")
+                return name
+        except Exception as e:
+            logger.error(f"CREA: image upload to ComfyUI failed: {e}")
+            return None
 
     def _comfyui_submit(self, workflow: dict) -> str | None:
         try:
@@ -190,7 +262,7 @@ class CREAAgent(BaseAgent):
                     res.raise_for_status()
                     history = res.json()
                 if prompt_id in history:
-                    images = history[prompt_id].get("outputs", {}).get("9", {}).get("images", [])
+                    images = history[prompt_id].get("outputs", {}).get("10", {}).get("images", [])
                     if images:
                         filename = images[0].get("filename")
                         logger.info(f"CREA: ComfyUI done — filename={filename}")
@@ -214,7 +286,7 @@ class CREAAgent(BaseAgent):
             "dimensions": f"{dim_info['w']}x{dim_info['h']}",
             "qa_score": json.dumps(qa_score or {}), "qa_passed": qa_passed,
             "status": "draft", "approved": False,
-            "generation_model": "juggernautXL_ragnarok",
+            "generation_model": "flux1-dev",
             "created_at": datetime.now(timezone.utc).isoformat(),
         })
         return row["id"] if row else None
