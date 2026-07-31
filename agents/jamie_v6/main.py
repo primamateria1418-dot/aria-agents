@@ -30,6 +30,7 @@ from mission_planner import plan_mission, print_plan
 from browser_navigator import BrowserNavigator
 from apollo_client import ApolloClient, ApolloError
 from lead_tracker import LeadTracker
+from supabase_sync import push_mission_results, SupabaseSyncError
 
 
 def execute_step(step: dict, mission: str, nav: BrowserNavigator, tracker: LeadTracker):
@@ -155,6 +156,12 @@ def run_mission(mission: str, enrich_contacts: bool = False) -> LeadTracker:
                 print(f"  ✅ {lead.name}: Apollo record found, {n} contact(s) pulled")
             else:
                 print(f"  ❔ {lead.name}: no Apollo record — contact info unavailable")
+
+    print(f"\n📤 Pushing scored results to Supabase...")
+    try:
+        push_mission_results(mission, tracker)
+    except SupabaseSyncError as e:
+        print(f"  ⚠️  Skipped Supabase push: {e}")
 
     return tracker
 
