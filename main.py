@@ -251,6 +251,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(title="ARIA™ Orchestrator", description="Autonomous Marketing Agency — OUP International Ltd", version="5.0.0", lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.include_router(crm_router)
 
 # ═══════════════════════════════════════════════════════════════
 #  REQUEST MODELS
