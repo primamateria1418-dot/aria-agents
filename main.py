@@ -23,6 +23,7 @@ from fastapi import (
     UploadFile, File, Form, Request,
 )
 from fastapi.middleware.cors import CORSMiddleware
+from crm_routes import router as crm_router
 from fastapi.responses import RedirectResponse
 from pydantic import BaseModel
 from typing import Optional, List
